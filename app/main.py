@@ -522,31 +522,43 @@ async def _check_sipuni_secret(request: Request) -> None:
         raise HTTPException(status_code=403, detail="invalid_sipuni_secret")
 
 
-@app.post("/sipuni/webhook/status")
+@app.api_route("/sipuni/webhook/status", methods=["GET", "POST"])
 async def sipuni_status_webhook(
     request: Request,
     _: None = Depends(_check_sipuni_secret),
 ):
     """
-    Принимает webhook от Sipuni со статусом звонка. Поддерживает JSON
-    и form-data, потому что Sipuni может слать и так и так в зависимости
-    от настроек интеграции.
+    Принимает webhook от Sipuni со статусом звонка. Поддерживает GET и POST,
+    JSON и form-data — Sipuni («События на АТС») шлёт GET с query-параметрами,
+    но оставляем POST/JSON/form на случай других схем интеграции.
     """
     body: dict = {}
+    # 1) query-параметры (Sipuni "События на АТС" шлёт всё в URL через GET)
+    for k, v in request.query_params.items():
+        body[k] = v
+    # 2) тело запроса, если есть (POST JSON или form) — дополняет/перекрывает
     try:
-        body = await request.json()
+        json_body = await request.json()
+        if isinstance(json_body, dict):
+            body.update(json_body)
     except Exception:
         try:
             form = await request.form()
-            body = {k: v for k, v in form.items()}
+            for k, v in form.items():
+                body[k] = v
         except Exception:
-            body = {}
+            pass
 
     if not isinstance(body, dict):
         body = {}
 
     parsed = parse_sipuni_webhook(body)
     logger.info("[sipuni-webhook] %s", parsed)
+
+    # Sipuni шлёт event=1 (звонок начат) и event=2 (завершён).
+    # Реагируем только на финальное событие, начало просто подтверждаем.
+    if not parsed.get("event_finished"):
+        return {"ok": True, "ignored": "not_final_event"}
 
     return await handle_sipuni_status(
         sipnumber=parsed.get("sipnumber"),

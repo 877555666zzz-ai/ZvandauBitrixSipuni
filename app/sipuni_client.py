@@ -84,24 +84,30 @@ async def make_outbound_call(manager_sipnumber: str, client_number: str) -> dict
 
 def parse_sipuni_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Распарсить вебхук Sipuni со статусом звонка в единый формат:
+    Распарсить вебхук Sipuni («События на АТС») в единый формат:
       {
         "sipnumber": str | None,       — внутренний номер менеджера
         "client_phone": str | None,    — номер клиента
         "talk_seconds": float | None,  — длительность разговора в секундах
         "answered": bool,              — был ли реальный ответ
+        "event_finished": bool,        — это финальное событие (event=2)?
         "raw": dict,                   — оригинальное тело
       }
 
-    Sipuni шлёт разные форматы (event 1.6, 1.7, через «Функции» или нативные
-    webhooks). Покрываем самые частые ключи. Если в твоём кабинете формат
-    другой — поправь маппинг тут, остальной код не трогая.
+    Реальный формат Sipuni «События на АТС» (GET query):
+      event=1  — звонок начат; event=2 — звонок завершён (финальное)
+      status=ANSWER|NOANSWER|BUSY|... — итог (только в event=2)
+      short_src_num — внутренний номер менеджера (напр. 205)
+      dst_num / short_dst_num — номер клиента
+      call_start_timestamp + timestamp — для вычисления длительности
+      last_called — внутренний номер, которого реально звали
+
+    Если формат в кабинете другой — правится только этот маппинг.
     """
     def _first(keys: List[str]) -> Optional[Any]:
         for k in keys:
             if k in body and body[k] not in (None, ""):
                 return body[k]
-            # пробуем nested ключ
             if "." in k:
                 cur: Any = body
                 for part in k.split("."):
@@ -114,24 +120,43 @@ def parse_sipuni_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
                     return cur
         return None
 
-    sipnumber = _first(["sipnumber", "manager", "internal", "from_internal", "src"])
-    client_phone = _first(["phone", "client_phone", "external", "to", "number", "dst"])
+    # Менеджер: предпочитаем короткий внутренний номер
+    sipnumber = _first([
+        "short_src_num", "last_called", "sipnumber",
+        "manager", "internal", "from_internal", "src",
+    ])
+    # Клиент: внешний номер назначения
+    client_phone = _first([
+        "dst_num", "short_dst_num", "phone", "client_phone",
+        "external", "to", "number", "dst",
+    ])
 
-    duration_raw = _first(["duration", "talk_duration", "bill_seconds",
-                           "billsec", "talkSeconds"])
-    talk_seconds: Optional[float]
+    # Событие: 1 = начат, 2 = завершён (финальное)
+    event_raw = _first(["event"])
+    event_finished = str(event_raw) == "2"
+
+    # Длительность разговора: timestamp(финал) - call_start_timestamp
+    talk_seconds: Optional[float] = None
+    ts_end = _first(["timestamp"])
+    ts_start = _first(["call_start_timestamp"])
     try:
-        talk_seconds = float(duration_raw) if duration_raw is not None else None
+        if ts_end is not None and ts_start is not None:
+            talk_seconds = max(0.0, float(ts_end) - float(ts_start))
     except (TypeError, ValueError):
         talk_seconds = None
+    # запасной вариант — явное поле длительности, если придёт
+    if talk_seconds is None:
+        dur = _first(["duration", "talk_duration", "billsec", "bill_seconds"])
+        try:
+            talk_seconds = float(dur) if dur is not None else None
+        except (TypeError, ValueError):
+            talk_seconds = None
 
-    # Sipuni шлёт разные индикаторы факта разговора
+    # Факт ответа: статус ANSWER (Sipuni шлёт NOANSWER/ANSWER/BUSY/...)
     status_raw = _first(["status", "callStatus", "disposition", "state"])
     answered = False
-    if talk_seconds and talk_seconds >= settings.MIN_TALK_DURATION_SECONDS:
-        answered = True
-    if isinstance(status_raw, str) and status_raw.lower() in (
-        "answered", "answer", "talk", "completed", "success", "1"
+    if isinstance(status_raw, str) and status_raw.strip().upper() in (
+        "ANSWER", "ANSWERED", "TALK", "COMPLETED", "SUCCESS",
     ):
         answered = True
 
@@ -140,6 +165,7 @@ def parse_sipuni_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
         "client_phone": str(client_phone) if client_phone else None,
         "talk_seconds": talk_seconds,
         "answered": bool(answered),
+        "event_finished": event_finished,
         "raw": body,
     }
 
