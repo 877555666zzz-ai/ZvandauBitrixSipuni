@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Set
 
 from sqlalchemy import delete, select
 
-from .bitrix_client import add_lead_comment, update_lead_status
+from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status
 from .config import settings
 from .db import async_session_maker
 from .models import AutodialQueue, CallLog, CallSession, Manager
@@ -463,6 +463,14 @@ async def handle_sipuni_status(
                 talk_seconds=talk_seconds,
                 message=f"Реально соединились ({talk_seconds:.0f}с разговор)" if talk_seconds else "Соединились",
             )
+            # Пишем комментарий — универсально для лида и сделки
+            comment_text = (
+                f"Автодозвон: соединились с клиентом ✅ "
+                f"Менеджер: {s.manager_name}. "
+                f"Разговор: {int(talk_seconds or 0)} сек."
+            )
+            await add_lead_comment(s.lead_id, comment_text)
+            await add_deal_comment(s.lead_id, comment_text)
             logger.info(
                 "[sipuni-webhook] лид %d CONNECTED (%.0fс)",
                 s.lead_id, talk_seconds or 0,

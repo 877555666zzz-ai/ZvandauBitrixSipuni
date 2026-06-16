@@ -34,6 +34,86 @@ async def get_lead(lead_id: int) -> dict:
     return await _post(url, {"id": lead_id})
 
 
+# ─── Сделки (Яндекс 360, category=12) ────────
+async def get_deal(deal_id: int) -> dict:
+    url = settings.bitrix_base_url + "crm.deal.get.json"
+    return await _post(url, {"id": deal_id})
+
+
+def extract_phone_from_deal(deal: dict) -> Optional[str]:
+    """Достать телефон из сделки — через контакт или поле PHONE."""
+    if not isinstance(deal, dict):
+        return None
+    result = deal.get("result") or {}
+    # Сделки хранят телефон в UF-полях или через контакт.
+    # Пробуем стандартные поля.
+    for field in ("PHONE", "UF_CRM_PHONE"):
+        phones = result.get(field)
+        if isinstance(phones, list) and phones:
+            for ph in phones:
+                if isinstance(ph, dict):
+                    v = (ph.get("VALUE") or "").strip()
+                    if v:
+                        return v
+            # может быть просто строкой
+        elif isinstance(phones, str) and phones.strip():
+            return phones.strip()
+    return None
+
+
+async def get_deal_contact_phone(deal: dict) -> Optional[str]:
+    """Если телефон не в самой сделке — идём в контакт."""
+    if not isinstance(deal, dict):
+        return None
+    result = deal.get("result") or {}
+    contact_id = result.get("CONTACT_ID")
+    if not contact_id:
+        return None
+    try:
+        url = settings.bitrix_base_url + "crm.contact.get.json"
+        contact = await _post(url, {"id": contact_id})
+        phones = (contact.get("result") or {}).get("PHONE") or []
+        if isinstance(phones, list):
+            for ph in phones:
+                if isinstance(ph, dict):
+                    v = (ph.get("VALUE") or "").strip()
+                    if v:
+                        return v
+    except Exception as e:
+        logger.warning("[bitrix] get_deal_contact_phone failed: %s", e)
+    return None
+
+
+def extract_deal_meta(deal: dict) -> Dict[str, Optional[str]]:
+    """Достать имя и источник из сделки."""
+    if not isinstance(deal, dict):
+        return {"name": None, "source": None}
+    result = deal.get("result") or {}
+    name = (result.get("TITLE") or "").strip() or None
+    source = result.get("SOURCE_ID") or None
+    return {
+        "name": name,
+        "source": str(source) if source else None,
+    }
+
+
+async def add_deal_comment(deal_id: int, comment: str) -> Optional[dict]:
+    """Добавить комментарий в таймлайн сделки."""
+    url = settings.bitrix_base_url + "crm.timeline.comment.add.json"
+    payload = {
+        "fields": {
+            "ENTITY_ID": deal_id,
+            "ENTITY_TYPE": "deal",
+            "COMMENT": comment,
+        }
+    }
+    try:
+        return await _post(url, payload)
+    except Exception as e:
+        logger.error("[bitrix] add_deal_comment(%d) failed: %s", deal_id, e)
+        return None
+
+
 def extract_phone(lead: dict) -> Optional[str]:
     """Достать первый телефон. Приоритет WORK→MOBILE→HOME→OTHER."""
     if not isinstance(lead, dict):

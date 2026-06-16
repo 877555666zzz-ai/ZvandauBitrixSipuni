@@ -24,7 +24,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
-from .bitrix_client import extract_lead_meta, extract_phone, get_lead
+from .bitrix_client import (
+    add_deal_comment,
+    extract_deal_meta,
+    extract_lead_meta,
+    extract_phone,
+    extract_phone_from_deal,
+    get_deal,
+    get_deal_contact_phone,
+    get_lead,
+)
 from .config import settings
 from .db import async_session_maker, init_db
 from .dispatcher import (
@@ -507,6 +516,115 @@ async def bitrix_lead_webhook(
 
     background_tasks.add_task(_process, lead_id, received_at)
     return {"ok": True, "lead_id": lead_id, "queued": True}
+
+
+# ─── Webhook для сделок (Яндекс 360, category=12) ──────────────────────────
+@app.post("/bitrix/webhook/deal")
+async def bitrix_deal_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(_check_bitrix_secret),
+):
+    """
+    Принимает новые сделки из воронки «Яндекс 360» (category=12).
+    Триггер: сделка создана или попала в стадию «Тёплые лиды» (C12:NEW).
+    Стадии НЕ двигаем — только звоним и пишем комментарии.
+    """
+    received_at = datetime.utcnow()
+    deal_id: Optional[int] = None
+
+    # Bitrix шлёт form-data или JSON — пробуем оба варианта
+    try:
+        form = await request.form()
+        raw = (
+            form.get("data[FIELDS][ID]")
+            or form.get("FIELDS[ID]")
+            or form.get("deal_id")
+        )
+        if raw:
+            deal_id = int(str(raw))
+    except Exception:
+        pass
+
+    if deal_id is None:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                fields = (body.get("data") or {}).get("FIELDS") or {}
+                raw = fields.get("ID") or body.get("deal_id")
+                if raw:
+                    deal_id = int(str(raw))
+        except Exception:
+            pass
+
+    if deal_id is None:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "deal_id_not_found"}
+        )
+
+    logger.info("[webhook-deal] сделка #%d", deal_id)
+
+    async def _process_deal(d_id: int, ts: datetime) -> None:
+        try:
+            deal = await get_deal(d_id)
+        except Exception as e:
+            logger.error("[webhook-deal] get_deal(%d) failed: %s", d_id, e)
+            return
+
+        result = deal.get("result") or {}
+
+        # Фильтр: только воронка Яндекс 360 (category_id=12)
+        category_id = str(result.get("CATEGORY_ID") or "")
+        if category_id != "12":
+            logger.info(
+                "[webhook-deal] сделка #%d: category=%s, не наша воронка — игнор",
+                d_id, category_id,
+            )
+            return
+
+        # Фильтр: только стадия «Тёплые лиды»
+        stage = result.get("STAGE_ID") or ""
+        if stage != "C12:NEW":
+            logger.info(
+                "[webhook-deal] сделка #%d: стадия=%s, не C12:NEW — игнор",
+                d_id, stage,
+            )
+            return
+
+        # Телефон: сначала из самой сделки, потом из контакта
+        phone = extract_phone_from_deal(deal)
+        if not phone:
+            phone = await get_deal_contact_phone(deal)
+        if not phone:
+            logger.warning("[webhook-deal] сделка #%d: нет телефона", d_id)
+            await add_deal_comment(
+                d_id,
+                "Автодозвон: не удалось запустить — в сделке нет номера телефона.",
+            )
+            return
+
+        meta = extract_deal_meta(deal)
+        logger.info(
+            "[webhook-deal] сделка #%d | телефон=%s | название=%s",
+            d_id, phone, meta.get("name"),
+        )
+
+        # Комментарий «взяли в работу»
+        await add_deal_comment(
+            d_id,
+            f"Автодозвон: сделка взята в работу, запускаем звонок.",
+        )
+
+        # Запускаем ту же логику что и для лидов
+        await process_new_lead(
+            d_id, phone,
+            lead_name=meta.get("name"),
+            lead_source=meta.get("source"),
+            received_at=ts,
+        )
+
+    background_tasks.add_task(_process_deal, deal_id, received_at)
+    return {"ok": True, "deal_id": deal_id, "queued": True}
 
 
 # ─── Sipuni status webhook ──────────────────────────────────
