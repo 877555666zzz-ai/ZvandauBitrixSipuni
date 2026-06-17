@@ -254,6 +254,52 @@ async def schedule_autodial(
 # ─────────────────────────────────────────────
 # Основная логика
 # ─────────────────────────────────────────────
+async def _phone_recently_handled(phone: str, exclude_lead_id: int) -> bool:
+    """True, если на этот номер уже звоним/в очереди/звонили недавно.
+
+    Защита от дублей: один телефон = один звонок, даже если в Bitrix
+    создано несколько сделок с одним номером.
+    Проверяем: активная сессия, очередь автодозвона, звонок за последние 24ч.
+    """
+    if not phone:
+        return False
+    norm = phone.strip()
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=24)
+    async with async_session_maker() as session:
+        # 1) уже есть активная сессия на этот номер (идёт звонок)
+        active = await session.execute(
+            select(CallSession).where(
+                CallSession.phone == norm,
+                CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]),
+                CallSession.lead_id != exclude_lead_id,
+            )
+        )
+        if active.scalars().first():
+            return True
+        # 2) номер уже в очереди автодозвона (ждёт повтора)
+        queued = await session.execute(
+            select(AutodialQueue).where(
+                AutodialQueue.phone == norm,
+                AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS"]),
+                AutodialQueue.lead_id != exclude_lead_id,
+            )
+        )
+        if queued.scalars().first():
+            return True
+        # 3) на этот номер уже звонили за последние 24 часа
+        recent = await session.execute(
+            select(CallLog).where(
+                CallLog.phone == norm,
+                CallLog.timestamp >= cutoff,
+                CallLog.lead_id != exclude_lead_id,
+            )
+        )
+        if recent.scalars().first():
+            return True
+    return False
+
+
 async def process_new_lead(
     lead_id: int,
     client_phone: str,
@@ -269,6 +315,15 @@ async def process_new_lead(
     if not await _acquire_lead(lead_id):
         logger.info("[dispatch] лид %d уже обрабатывается", lead_id)
         return {"ok": True, "status": "already_in_progress", "lead_id": lead_id}
+
+    # Защита от дублей по телефону (только для новых лидов, не для автодозвона).
+    if not is_autodial and await _phone_recently_handled(client_phone, lead_id):
+        logger.info(
+            "[dispatch] лид %d: номер %s уже обрабатывается/звонили — дубль, пропуск",
+            lead_id, client_phone,
+        )
+        await _release_lead(lead_id)
+        return {"ok": True, "status": "duplicate_phone", "lead_id": lead_id}
 
     received_at = received_at or datetime.utcnow()
 
