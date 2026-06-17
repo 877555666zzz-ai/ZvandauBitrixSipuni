@@ -63,12 +63,42 @@ def _next_delay_minutes(attempt_number: int) -> int:
 
 
 async def _get_available_managers() -> List[Manager]:
+    now = datetime.utcnow()
     async with async_session_maker() as session:
         result = await session.execute(
             select(Manager).where(Manager.online.is_(True))
         )
         managers = list(result.scalars().all())
-    return sort_managers(managers)
+    # Отсеиваем занятых: busy_until в будущем = ещё на звонке/в передышке.
+    free = [
+        m for m in managers
+        if getattr(m, "busy_until", None) is None or m.busy_until <= now
+    ]
+    return sort_managers(free)
+
+
+# Сколько секунд менеджер «занят» после старта звонка (страховка от залипания).
+_BUSY_GUARD_SECONDS = 180
+# Передышка после завершения звонка перед новым.
+_COOLDOWN_SECONDS = 5
+
+
+async def _set_busy(manager_id: int, seconds: int) -> None:
+    """Пометить менеджера занятым на N секунд вперёд."""
+    async with async_session_maker() as session:
+        mgr = await session.get(Manager, manager_id)
+        if mgr:
+            mgr.busy_until = datetime.utcnow() + timedelta(seconds=seconds)
+            await session.commit()
+
+
+async def _release_after_cooldown(manager_id: int) -> None:
+    """Освободить менеджера через _COOLDOWN_SECONDS после завершения звонка."""
+    async with async_session_maker() as session:
+        mgr = await session.get(Manager, manager_id)
+        if mgr:
+            mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
+            await session.commit()
 
 
 async def _log_call(
@@ -321,6 +351,9 @@ async def process_new_lead(
                 await _reset_missed(manager.id)
                 await _mark_accepted(manager.id)
                 await record_outcome(manager.id, success=True)
+                # Менеджер занят на время звонка (страховка 3 мин от залипания,
+                # реально снимется через 5с после завершения звонка).
+                await _set_busy(manager.id, _BUSY_GUARD_SECONDS)
 
                 await _log_call(
                     lead_id=lead_id, phone=client_phone, call_type=call_type,
@@ -471,6 +504,8 @@ async def handle_sipuni_status(
             )
             await add_lead_comment(s.lead_id, comment_text)
             await add_deal_comment(s.lead_id, comment_text)
+            if s.manager_id:
+                await _release_after_cooldown(s.manager_id)
             logger.info(
                 "[sipuni-webhook] лид %d CONNECTED (%.0fс)",
                 s.lead_id, talk_seconds or 0,
@@ -492,6 +527,7 @@ async def handle_sipuni_status(
                         mgr.online = False
                     await s2.commit()
             await record_outcome(s.manager_id, success=False)
+            await _release_after_cooldown(s.manager_id)
 
         # Лид в очередь
         await _log_call(

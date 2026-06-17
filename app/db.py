@@ -32,5 +32,19 @@ Base = declarative_base()
 
 async def init_db() -> None:
     from . import models  # noqa: F401
+    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Лёгкая миграция: добавить busy_until, если колонки ещё нет.
+        # PostgreSQL поддерживает IF NOT EXISTS. Для SQLite оборачиваем в try.
+        if settings.DATABASE_URL.startswith("postgresql"):
+            await conn.execute(text(
+                "ALTER TABLE managers ADD COLUMN IF NOT EXISTS busy_until TIMESTAMP"
+            ))
+        else:
+            try:
+                await conn.execute(text(
+                    "ALTER TABLE managers ADD COLUMN busy_until TIMESTAMP"
+                ))
+            except Exception:
+                pass  # колонка уже есть

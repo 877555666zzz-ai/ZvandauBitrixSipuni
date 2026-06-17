@@ -36,6 +36,11 @@ class Manager(Base):
     missed = Column(Integer, default=0, nullable=False)
     accepted_calls = Column(Integer, default=0, nullable=False)
 
+    # Занятость: менеджер недоступен для новых звонков до этого времени (UTC).
+    # Ставится при callback, снимается через 5с после завершения звонка.
+    # NULL или прошедшее время = свободен.
+    busy_until = Column(DateTime, nullable=True)
+
     # Persistent priority. score = ok / total, total с decay.
     # Чем выше score, тем чаще идут лиды. Дефолт 0.5 — нейтрально.
     priority_score = Column(Float, default=0.5, nullable=False)
