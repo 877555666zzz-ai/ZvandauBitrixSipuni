@@ -40,47 +40,156 @@ async def get_deal(deal_id: int) -> dict:
     return await _post(url, {"id": deal_id})
 
 
-def extract_phone_from_deal(deal: dict) -> Optional[str]:
-    """Достать телефон из сделки — через контакт или поле PHONE."""
-    if not isinstance(deal, dict):
+import re
+
+# Минимальная длина номера в цифрах, чтобы считать строку телефоном.
+_MIN_PHONE_DIGITS = 10
+
+
+def _digits_only(s: str) -> str:
+    """Оставить только цифры (и ведущий +)."""
+    if not s:
+        return ""
+    s = s.strip()
+    plus = s.startswith("+")
+    digits = re.sub(r"\D", "", s)
+    return ("+" + digits) if plus else digits
+
+
+def _looks_like_phone(s: str) -> Optional[str]:
+    """Если строка похожа на телефон (>=10 цифр) — вернуть нормализованный, иначе None."""
+    if not s or not isinstance(s, str):
         return None
-    result = deal.get("result") or {}
-    # Сделки хранят телефон в UF-полях или через контакт.
-    # Пробуем стандартные поля.
-    for field in ("PHONE", "UF_CRM_PHONE"):
-        phones = result.get(field)
-        if isinstance(phones, list) and phones:
-            for ph in phones:
-                if isinstance(ph, dict):
-                    v = (ph.get("VALUE") or "").strip()
-                    if v:
-                        return v
-            # может быть просто строкой
-        elif isinstance(phones, str) and phones.strip():
-            return phones.strip()
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= _MIN_PHONE_DIGITS:
+        # сохраняем как есть (с + если был), Sipuni сам разберётся
+        cleaned = _digits_only(s)
+        return cleaned or None
     return None
 
 
-async def get_deal_contact_phone(deal: dict) -> Optional[str]:
-    """Если телефон не в самой сделке — идём в контакт."""
+def _phone_from_field(value: Any) -> Optional[str]:
+    """Вытащить телефон из значения поля Bitrix (список PHONE или строка)."""
+    if isinstance(value, list):
+        for ph in value:
+            if isinstance(ph, dict):
+                v = (ph.get("VALUE") or "").strip()
+                if v:
+                    return v
+            elif isinstance(ph, str) and ph.strip():
+                return ph.strip()
+    elif isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _scan_entity_for_phone(entity: dict) -> Optional[str]:
+    """Просканировать сущность (сделку/контакт/компанию) по всем вероятным местам."""
+    if not isinstance(entity, dict):
+        return None
+    # 1) стандартные телефонные поля
+    for field in ("PHONE", "UF_CRM_PHONE", "UF_PHONE"):
+        v = _phone_from_field(entity.get(field))
+        if v:
+            return v
+    # 2) любые UF-поля, в значении которых что-то похожее на телефон
+    for key, value in entity.items():
+        if not isinstance(key, str):
+            continue
+        if key.startswith("UF_") or "PHONE" in key.upper():
+            if isinstance(value, (str, list)):
+                cand = _phone_from_field(value) if isinstance(value, list) else value
+                ph = _looks_like_phone(cand) if isinstance(cand, str) else None
+                if ph:
+                    return ph
+    # 3) название/заголовок (TITLE, NAME) — иногда номер прямо там
+    for field in ("TITLE", "NAME", "SECOND_NAME", "LAST_NAME", "COMPANY_TITLE"):
+        v = entity.get(field)
+        if isinstance(v, str):
+            ph = _looks_like_phone(v)
+            if ph:
+                return ph
+    return None
+
+
+def extract_phone_from_deal(deal: dict) -> Optional[str]:
+    """Достать телефон из самой сделки (поля + UF + название)."""
     if not isinstance(deal, dict):
         return None
     result = deal.get("result") or {}
-    contact_id = result.get("CONTACT_ID")
-    if not contact_id:
+    return _scan_entity_for_phone(result)
+
+
+async def get_deal_contact_phone(deal: dict) -> Optional[str]:
+    """Телефон через контакт(ы) сделки. Поддержка одного и нескольких контактов."""
+    if not isinstance(deal, dict):
+        return None
+    result = deal.get("result") or {}
+    contact_ids: List[Any] = []
+    # одиночный контакт
+    cid = result.get("CONTACT_ID")
+    if cid and str(cid) != "0":
+        contact_ids.append(cid)
+    # несколько контактов (если есть)
+    multi = result.get("CONTACT_IDS")
+    if isinstance(multi, list):
+        contact_ids.extend([c for c in multi if c and str(c) != "0"])
+    for contact_id in contact_ids:
+        try:
+            url = settings.bitrix_base_url + "crm.contact.get.json"
+            contact = await _post(url, {"id": contact_id})
+            entity = (contact.get("result") or {})
+            v = _scan_entity_for_phone(entity)
+            if v:
+                return v
+        except Exception as e:
+            logger.warning("[bitrix] get_deal_contact_phone failed (%s): %s", contact_id, e)
+    return None
+
+
+async def get_deal_company_phone(deal: dict) -> Optional[str]:
+    """Телефон через компанию сделки (поле PHONE + название + UF)."""
+    if not isinstance(deal, dict):
+        return None
+    result = deal.get("result") or {}
+    company_id = result.get("COMPANY_ID")
+    if not company_id or str(company_id) == "0":
         return None
     try:
-        url = settings.bitrix_base_url + "crm.contact.get.json"
-        contact = await _post(url, {"id": contact_id})
-        phones = (contact.get("result") or {}).get("PHONE") or []
-        if isinstance(phones, list):
-            for ph in phones:
-                if isinstance(ph, dict):
-                    v = (ph.get("VALUE") or "").strip()
-                    if v:
-                        return v
+        url = settings.bitrix_base_url + "crm.company.get.json"
+        company = await _post(url, {"id": company_id})
+        entity = (company.get("result") or {})
+        # для компании TITLE — это её название, часто туда пишут номер
+        v = _scan_entity_for_phone(entity)
+        if v:
+            return v
     except Exception as e:
-        logger.warning("[bitrix] get_deal_contact_phone failed: %s", e)
+        logger.warning("[bitrix] get_deal_company_phone failed: %s", e)
+    return None
+
+
+async def find_deal_phone(deal: dict) -> Optional[str]:
+    """Всеядный поиск телефона сделки: перебирает все источники по очереди.
+
+    Порядок: поля самой сделки → контакт(ы) → компания.
+    На каждом шаге сканируются стандартные поля, UF-поля и названия.
+    Возвращает первый найденный номер или None.
+    """
+    # 1) сама сделка (поля, UF, TITLE)
+    phone = extract_phone_from_deal(deal)
+    if phone:
+        logger.info("[bitrix] телефон найден в самой сделке")
+        return phone
+    # 2) контакт(ы)
+    phone = await get_deal_contact_phone(deal)
+    if phone:
+        logger.info("[bitrix] телефон найден в контакте сделки")
+        return phone
+    # 3) компания
+    phone = await get_deal_company_phone(deal)
+    if phone:
+        logger.info("[bitrix] телефон найден в компании сделки")
+        return phone
     return None
 
 

@@ -30,7 +30,9 @@ from .bitrix_client import (
     extract_lead_meta,
     extract_phone,
     extract_phone_from_deal,
+    find_deal_phone,
     get_deal,
+    get_deal_company_phone,
     get_deal_contact_phone,
     get_lead,
 )
@@ -591,10 +593,8 @@ async def bitrix_deal_webhook(
             )
             return
 
-        # Телефон: сначала из самой сделки, потом из контакта
-        phone = extract_phone_from_deal(deal)
-        if not phone:
-            phone = await get_deal_contact_phone(deal)
+        # Телефон: всеядный поиск — сделка → контакт(ы) → компания (поля, UF, названия)
+        phone = await find_deal_phone(deal)
         if not phone:
             logger.warning("[webhook-deal] сделка #%d: нет телефона", d_id)
             await add_deal_comment(
