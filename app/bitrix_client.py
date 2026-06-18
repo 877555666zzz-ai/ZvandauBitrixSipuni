@@ -1,6 +1,8 @@
 # app/bitrix_client.py
 """Bitrix24 client. Status_id берётся из ENV."""
+import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -11,11 +13,31 @@ logger = logging.getLogger(__name__)
 
 _RETRIES = 2
 
+# ── Throttle запросов к Bitrix ───────────────────────────────
+# Bitrix ограничивает частоту REST-запросов (порядка 2/сек). При пике сделок
+# мы делаем много запросов (get + comment + update на каждую). Чтобы не ловить
+# ошибки лимита, выдерживаем минимальный интервал между запросами.
+_MIN_INTERVAL_SECONDS = 0.5  # ~2 запроса в секунду
+_throttle_lock = asyncio.Lock()
+_last_request_ts = 0.0
+
+
+async def _throttle() -> None:
+    """Подождать, чтобы не превысить частоту запросов к Bitrix."""
+    global _last_request_ts
+    async with _throttle_lock:
+        now = time.monotonic()
+        wait = _MIN_INTERVAL_SECONDS - (now - _last_request_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request_ts = time.monotonic()
+
 
 async def _post(url: str, payload: dict) -> dict:
     last_exc: Optional[Exception] = None
     for attempt in range(1, _RETRIES + 2):
         try:
+            await _throttle()
             async with httpx.AsyncClient(timeout=settings.BITRIX_TIMEOUT_SECONDS) as client:
                 r = await client.post(url, json=payload)
                 r.raise_for_status()

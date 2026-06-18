@@ -48,3 +48,16 @@ async def init_db() -> None:
                 ))
             except Exception:
                 pass  # колонка уже есть
+
+        # При старте сервиса сбрасываем «занятость» менеджеров и снимаем все
+        # блокировки лидов: после рестарта старые звонки уже не активны, а
+        # подвисшие busy_until/блокировки иначе держали бы менеджеров и лиды
+        # заблокированными. Чистый старт = корректное состояние.
+        try:
+            await conn.execute(text("UPDATE managers SET busy_until = NULL"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("DELETE FROM lead_locks"))
+        except Exception:
+            pass  # таблицы может ещё не быть на самом первом старте

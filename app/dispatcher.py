@@ -16,14 +16,15 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 
 from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status
 from .config import settings
 from .db import async_session_maker
-from .models import AutodialQueue, CallLog, CallSession, Manager
+from .models import AutodialQueue, CallLog, CallSession, LeadLock, Manager
 from .priority import record_outcome, sort_managers
 from .sipuni_client import make_outbound_call
 from .telegram import send_alert
@@ -32,23 +33,70 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# Idempotency
+# Нормализация телефона
 # ─────────────────────────────────────────────
-_active_leads: Set[int] = set()
-_active_lock = asyncio.Lock()
+def normalize_phone(phone: Optional[str]) -> str:
+    """Привести телефон к единому виду — последние 10 цифр.
+
+    Нужно, чтобы один и тот же номер в разных форматах считался одинаковым:
+      +77075502088   → 7075502088
+      77075502088    → 7075502088
+      87075502088    → 7075502088
+      7 707 550 2088 → 7075502088
+    Так защита от дублей и матчинг сессий работают надёжно.
+    """
+    if not phone:
+        return ""
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    # последние 10 цифр = номер без кода страны (7/8) и разделителей
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+# ─────────────────────────────────────────────
+# Idempotency — блокировка лида через БД (переживает рестарт, работает
+# при нескольких репликах). Старая версия с Set в памяти теряла блокировки
+# при каждом деплое.
+# ─────────────────────────────────────────────
+# Сколько живёт блокировка, прежде чем считается «протухшей» и может быть
+# перехвачена. Защита от вечного залипания при сбое процесса.
+_LEAD_LOCK_TTL_SECONDS = 600  # 10 минут
 
 
 async def _acquire_lead(lead_id: int) -> bool:
-    async with _active_lock:
-        if lead_id in _active_leads:
+    """Захватить лид. True — захватили, False — уже обрабатывается.
+
+    Атомарно через БД: вставка строки с lead_id (PK). Если строка уже есть
+    и свежая — занято. Если протухла (TTL) — перехватываем.
+    """
+    now = datetime.utcnow()
+    stale_before = now - timedelta(seconds=_LEAD_LOCK_TTL_SECONDS)
+    async with async_session_maker() as session:
+        # Сначала убираем протухшую блокировку этого лида, если есть.
+        await session.execute(
+            delete(LeadLock).where(
+                LeadLock.lead_id == lead_id,
+                LeadLock.acquired_at < stale_before,
+            )
+        )
+        await session.commit()
+        # Пытаемся вставить свежую блокировку.
+        session.add(LeadLock(lead_id=lead_id, acquired_at=now))
+        try:
+            await session.commit()
+            return True
+        except IntegrityError:
+            # Строка уже есть и не протухла → лид занят.
+            await session.rollback()
             return False
-        _active_leads.add(lead_id)
-        return True
 
 
 async def _release_lead(lead_id: int) -> None:
-    async with _active_lock:
-        _active_leads.discard(lead_id)
+    """Снять блокировку лида."""
+    async with async_session_maker() as session:
+        await session.execute(
+            delete(LeadLock).where(LeadLock.lead_id == lead_id)
+        )
+        await session.commit()
 
 
 # ─────────────────────────────────────────────
@@ -263,40 +311,42 @@ async def _phone_recently_handled(phone: str, exclude_lead_id: int) -> bool:
     """
     if not phone:
         return False
-    norm = phone.strip()
+    norm = normalize_phone(phone)
+    if not norm:
+        return False
     now = datetime.utcnow()
     cutoff = now - timedelta(hours=24)
     async with async_session_maker() as session:
         # 1) уже есть активная сессия на этот номер (идёт звонок)
         active = await session.execute(
-            select(CallSession).where(
-                CallSession.phone == norm,
+            select(CallSession.phone, CallSession.lead_id).where(
                 CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]),
                 CallSession.lead_id != exclude_lead_id,
             )
         )
-        if active.scalars().first():
-            return True
+        for ph, _lid in active.all():
+            if normalize_phone(ph) == norm:
+                return True
         # 2) номер уже в очереди автодозвона (ждёт повтора)
         queued = await session.execute(
-            select(AutodialQueue).where(
-                AutodialQueue.phone == norm,
+            select(AutodialQueue.phone, AutodialQueue.lead_id).where(
                 AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS"]),
                 AutodialQueue.lead_id != exclude_lead_id,
             )
         )
-        if queued.scalars().first():
-            return True
+        for ph, _lid in queued.all():
+            if normalize_phone(ph) == norm:
+                return True
         # 3) на этот номер уже звонили за последние 24 часа
         recent = await session.execute(
-            select(CallLog).where(
-                CallLog.phone == norm,
+            select(CallLog.phone, CallLog.lead_id).where(
                 CallLog.timestamp >= cutoff,
                 CallLog.lead_id != exclude_lead_id,
             )
         )
-        if recent.scalars().first():
-            return True
+        for ph, _lid in recent.all():
+            if normalize_phone(ph) == norm:
+                return True
     return False
 
 
@@ -500,7 +550,7 @@ async def handle_sipuni_status(
         return {"ok": False, "error": "no_client_phone"}
 
     # Нормализация — Sipuni может слать с/без +, с пробелами и т.п.
-    norm_phone = "".join(ch for ch in client_phone if ch.isdigit())
+    norm_phone = normalize_phone(client_phone)
 
     async with async_session_maker() as session:
         # Ищем последнюю «висящую» сессию по этому телефону
@@ -516,9 +566,9 @@ async def handle_sipuni_status(
 
     matched: Optional[CallSession] = None
     for s in candidates:
-        s_norm = "".join(ch for ch in (s.phone or "") if ch.isdigit())
-        # Совпадение по последним 10 цифрам (страна-код может различаться)
-        if s_norm[-10:] == norm_phone[-10:] and norm_phone:
+        s_norm = normalize_phone(s.phone)
+        # Совпадение по нормализованному номеру (последние 10 цифр)
+        if s_norm and norm_phone and s_norm == norm_phone:
             if sipnumber and s.manager_sipnumber and str(s.manager_sipnumber) != str(sipnumber):
                 continue
             matched = s
