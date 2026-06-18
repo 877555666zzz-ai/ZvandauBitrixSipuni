@@ -53,6 +53,46 @@ def normalize_phone(phone: Optional[str]) -> str:
 
 
 # ─────────────────────────────────────────────
+# Рабочее время дозвона
+# ─────────────────────────────────────────────
+# Звонки клиентам разрешены только в этом окне по местному времени (Алматы).
+# Вне окна сделки не звонят, а ждут открытия (ставятся в очередь на 11:00).
+# Сервер живёт в UTC, Алматы = UTC+5 (без перехода на летнее время).
+_TZ_OFFSET_HOURS = 5          # Алматы UTC+5
+_WORK_START_HOUR = 11         # с 11:00
+_WORK_END_HOUR = 21           # до 21:00 (в 21:00 уже не звоним)
+
+
+def _local_now() -> datetime:
+    """Текущее местное время (Алматы)."""
+    return datetime.utcnow() + timedelta(hours=_TZ_OFFSET_HOURS)
+
+
+def _within_working_hours(local_dt: Optional[datetime] = None) -> bool:
+    """True, если сейчас рабочее время (11:00–21:00 Алматы)."""
+    local_dt = local_dt or _local_now()
+    return _WORK_START_HOUR <= local_dt.hour < _WORK_END_HOUR
+
+
+def _next_window_open_utc() -> datetime:
+    """Ближайший момент открытия окна (11:00 Алматы), в UTC.
+
+    Используется как next_call_time, чтобы отложенная сделка позвонила
+    ровно когда откроется рабочее время, а не раньше.
+    """
+    local = _local_now()
+    today_open = local.replace(
+        hour=_WORK_START_HOUR, minute=0, second=0, microsecond=0
+    )
+    if local.hour < _WORK_START_HOUR:
+        target_local = today_open                       # ещё утро — сегодня в 11
+    else:
+        target_local = today_open + timedelta(days=1)   # уже день/вечер — завтра в 11
+    # обратно в UTC
+    return target_local - timedelta(hours=_TZ_OFFSET_HOURS)
+
+
+# ─────────────────────────────────────────────
 # Idempotency — блокировка лида через БД (переживает рестарт, работает
 # при нескольких репликах). Старая версия с Set в памяти теряла блокировки
 # при каждом деплое.
@@ -228,8 +268,15 @@ async def schedule_autodial(
     current_attempts: int,
     lead_name: Optional[str] = None,
     lead_source: Optional[str] = None,
+    next_call_time: Optional[datetime] = None,
 ) -> None:
     next_attempt = current_attempts + 1
+
+    # Если время звонка задано извне (например, отложка до открытия рабочего
+    # окна) — это не «провал попытки», номер попытки не увеличиваем.
+    forced_time = next_call_time is not None
+    if forced_time:
+        next_attempt = current_attempts
 
     if next_attempt > settings.MAX_AUTODIAL_ATTEMPTS:
         async with async_session_maker() as session:
@@ -261,7 +308,10 @@ async def schedule_autodial(
         return
 
     delay_min = _next_delay_minutes(next_attempt)
-    next_call_time = datetime.utcnow() + timedelta(minutes=delay_min)
+    if forced_time:
+        next_call_time = next_call_time  # уже задано извне (открытие окна)
+    else:
+        next_call_time = datetime.utcnow() + timedelta(minutes=delay_min)
 
     async with async_session_maker() as session:
         result = await session.execute(
@@ -316,11 +366,15 @@ async def _phone_recently_handled(phone: str, exclude_lead_id: int) -> bool:
         return False
     now = datetime.utcnow()
     cutoff = now - timedelta(hours=24)
+    # Зависшие сессии (рестарт во время звонка) не должны блокировать номер
+    # навечно — учитываем только свежие активные сессии.
+    session_stale = now - timedelta(minutes=15)
     async with async_session_maker() as session:
-        # 1) уже есть активная сессия на этот номер (идёт звонок)
+        # 1) уже есть активная (и свежая) сессия на этот номер (идёт звонок)
         active = await session.execute(
             select(CallSession.phone, CallSession.lead_id).where(
                 CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]),
+                CallSession.started_at >= session_stale,
                 CallSession.lead_id != exclude_lead_id,
             )
         )
@@ -374,6 +428,28 @@ async def process_new_lead(
         )
         await _release_lead(lead_id)
         return {"ok": True, "status": "duplicate_phone", "lead_id": lead_id}
+
+    # Рабочее время: новые лиды вне окна 11:00–21:00 не звонят сразу,
+    # а откладываются до открытия окна (звонок не разбудит клиента ночью).
+    if not is_autodial and not _within_working_hours():
+        next_open = _next_window_open_utc()
+        logger.info(
+            "[dispatch] лид %d: вне рабочего времени — отложен до %s UTC",
+            lead_id, next_open.strftime("%Y-%m-%d %H:%M"),
+        )
+        await _log_call(
+            lead_id=lead_id, phone=client_phone, call_type="initial",
+            status="scheduled", attempts=[],
+            lead_name=lead_name, lead_source=lead_source,
+            message="Вне рабочего времени — отложено до открытия окна",
+        )
+        await schedule_autodial(
+            lead_id, client_phone, current_attempts=0,
+            lead_name=lead_name, lead_source=lead_source,
+            next_call_time=next_open,
+        )
+        await _release_lead(lead_id)
+        return {"ok": True, "status": "outside_working_hours", "lead_id": lead_id}
 
     received_at = received_at or datetime.utcnow()
 
@@ -668,6 +744,13 @@ async def autodial_worker() -> None:
 
     while True:
         try:
+            # Вне рабочего окна 11:00–21:00 (Алматы) очередь не обзваниваем —
+            # отложенные лиды дождутся открытия. Гарантия: ночью клиентам
+            # не звоним ни по новым лидам, ни из очереди.
+            if not _within_working_hours():
+                await asyncio.sleep(interval)
+                continue
+
             now = datetime.utcnow()
             async with async_session_maker() as session:
                 result = await session.execute(
