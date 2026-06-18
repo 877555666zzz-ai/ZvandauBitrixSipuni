@@ -41,6 +41,7 @@ from .db import async_session_maker, init_db
 from .dispatcher import (
     autodial_worker,
     handle_sipuni_status,
+    mark_busy_from_sipuni,
     process_new_lead,
 )
 from .models import AutodialQueue, CallLog, CallSession, Manager
@@ -672,6 +673,14 @@ async def sipuni_status_webhook(
 
     parsed = parse_sipuni_webhook(body)
     logger.info("[sipuni-webhook] %s", parsed)
+
+    # По ЛЮБОМУ звонку оператора (наш, чужой, входящий, из другой воронки)
+    # обновляем его занятость — чтобы автодозвон не слал звонок поверх
+    # разговора. Срабатывает и на начало, и на завершение события.
+    await mark_busy_from_sipuni(
+        sipnumber=parsed.get("sipnumber"),
+        event_finished=bool(parsed.get("event_finished")),
+    )
 
     # Sipuni шлёт event=1 (звонок начат) и event=2 (завершён).
     # Реагируем только на финальное событие, начало просто подтверждаем.

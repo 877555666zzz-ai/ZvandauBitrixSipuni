@@ -189,6 +189,47 @@ async def _release_after_cooldown(manager_id: int) -> None:
             await session.commit()
 
 
+async def mark_busy_from_sipuni(sipnumber: Optional[str], event_finished: bool) -> None:
+    """Отметить занятость нашего оператора по ЛЮБОМУ звонку из Sipuni.
+
+    Sipuni шлёт события обо всех звонках на АТС — наших, чужих, входящих,
+    из других воронок. Если sipnumber совпадает с одним из НАШИХ операторов,
+    значит этот оператор реально на линии (неважно по какому поводу) — и наш
+    автодозвон не должен слать ему звонок поверх разговора.
+
+      event начался (event_finished=False) → оператор занят;
+      event завершён (event_finished=True) → освобождаем через передышку.
+
+    Операторов не из нашей базы (чужие sip-номера) игнорируем — их занятость
+    нам неважна.
+    """
+    if not sipnumber:
+        return
+    sip = str(sipnumber).strip()
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Manager).where(Manager.sipnumber == sip)
+        )
+        mgr = result.scalars().first()
+        if not mgr:
+            return  # это не наш оператор — пропускаем
+        if event_finished:
+            # звонок завершён → освобождаем через передышку
+            mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
+            logger.info(
+                "[busy] оператор %s (sip=%s) освободился после звонка (+%dс)",
+                mgr.name, sip, _COOLDOWN_SECONDS,
+            )
+        else:
+            # звонок начался/идёт → занят (со страховкой от залипания)
+            mgr.busy_until = datetime.utcnow() + timedelta(seconds=_BUSY_GUARD_SECONDS)
+            logger.info(
+                "[busy] оператор %s (sip=%s) занят — на линии",
+                mgr.name, sip,
+            )
+        await session.commit()
+
+
 async def _log_call(
     *,
     lead_id: int,
