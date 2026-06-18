@@ -303,7 +303,7 @@ async def manager_stats(
         "calls_no_answer": no_answer,
         "recent_calls": [
             {
-                "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+                "timestamp": (l.timestamp.isoformat() + "Z") if l.timestamp else None,
                 "lead_id": l.lead_id,
                 "lead_name": l.lead_name,
                 "phone": l.phone,
@@ -337,7 +337,7 @@ async def get_logs(
         "logs": [
             {
                 "id": l.id,
-                "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+                "timestamp": (l.timestamp.isoformat() + "Z") if l.timestamp else None,
                 "lead_id": l.lead_id,
                 "lead_name": l.lead_name,
                 "lead_source": l.lead_source,
@@ -359,7 +359,7 @@ async def get_logs(
                 "lead_source": q.lead_source,
                 "phone": q.phone,
                 "attempts": q.attempts,
-                "next_call_time": q.next_call_time.isoformat() if q.next_call_time else None,
+                "next_call_time": (q.next_call_time.isoformat() + "Z") if q.next_call_time else None,
                 "state": q.state,
             }
             for q in queue

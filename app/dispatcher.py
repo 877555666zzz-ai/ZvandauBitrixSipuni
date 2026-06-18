@@ -150,7 +150,7 @@ def _next_delay_minutes(attempt_number: int) -> int:
     return 30
 
 
-async def _get_available_managers() -> List[Manager]:
+async def _get_available_managers(exclude_manager_id: Optional[int] = None) -> List[Manager]:
     now = datetime.utcnow()
     async with async_session_maker() as session:
         result = await session.execute(
@@ -158,9 +158,12 @@ async def _get_available_managers() -> List[Manager]:
         )
         managers = list(result.scalars().all())
     # Отсеиваем занятых: busy_until в будущем = ещё на звонке/в передышке.
+    # И при необходимости исключаем конкретного оператора (того, кто только
+    # что не ответил — чтобы каскад шёл к следующему, а не звонил тому же).
     free = [
         m for m in managers
-        if getattr(m, "busy_until", None) is None or m.busy_until <= now
+        if (getattr(m, "busy_until", None) is None or m.busy_until <= now)
+        and (exclude_manager_id is None or m.id != exclude_manager_id)
     ]
     return sort_managers(free)
 
@@ -751,7 +754,6 @@ async def handle_sipuni_status(
             await record_outcome(s.manager_id, success=False)
             await _release_after_cooldown(s.manager_id)
 
-        # Лид в очередь
         await _log_call(
             lead_id=s.lead_id, phone=s.phone, call_type="sipuni_webhook",
             status="no_answer", attempts=[],
@@ -760,14 +762,44 @@ async def handle_sipuni_status(
             message="Sipuni: менеджер не ответил по факту",
         )
 
+        # ── КАСКАД: пробуем СЛЕДУЮЩЕГО свободного оператора ──────────
+        # Оператор не ответил → не сразу в очередь, а сначала пробуем
+        # передать лида следующему свободному (А не ответил → Б → В).
+        # В очередь на повтор откладываем ТОЛЬКО если свободных больше нет.
+        next_free = await _get_available_managers(exclude_manager_id=s.manager_id)
+        if next_free:
+            logger.info(
+                "[sipuni-webhook] лид %d: %s не ответил → каскад к следующему (%s)",
+                s.lead_id, s.manager_name, next_free[0].name,
+            )
+            await add_lead_comment(
+                s.lead_id,
+                f"Менеджер {s.manager_name} не ответил — передаём следующему "
+                f"свободному оператору.",
+            )
+            # Повторный запуск распределения: переберёт оставшихся свободных.
+            # attempts_used сохраняем — это та же попытка дозвона, не новая.
+            await process_new_lead(
+                s.lead_id, s.phone,
+                lead_name=None, lead_source=None,
+                is_autodial=True,  # не пишем дубль в working-hours/duplicate
+                received_at=datetime.utcnow(),
+            )
+            return {"ok": True, "matched": True, "state": "NO_ANSWER_CASCADED"}
+
+        # Свободных операторов больше нет — лид в очередь на повтор по таймеру.
+        logger.info(
+            "[sipuni-webhook] лид %d: все операторы не ответили/заняты → в очередь",
+            s.lead_id,
+        )
         await schedule_autodial(
             s.lead_id, s.phone, current_attempts=s.attempts_used,
         )
         await update_lead_status(s.lead_id, "retry")
         await add_lead_comment(
             s.lead_id,
-            f"Sipuni: менеджер {s.manager_name} не ответил по факту. "
-            f"Лид поставлен в автодозвон.",
+            f"Все операторы не ответили/заняты. Лид поставлен в автодозвон "
+            f"на повтор.",
         )
         logger.info(
             "[sipuni-webhook] лид %d NO_ANSWER, менеджер=%s",

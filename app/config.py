@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     SIPUNI_WEBHOOK_SECRET: Optional[str] = None
 
     # ── Бизнес-параметры ─────────────────────────────────────
-    MANAGER_ANSWER_TIMEOUT_SECONDS: int = 7
+    MANAGER_ANSWER_TIMEOUT_SECONDS: int = 30
     MAX_MANAGER_MISSED: int = 3
     MAX_AUTODIAL_ATTEMPTS: int = 6
     AUTODIAL_POLL_INTERVAL_SECONDS: int = 30
