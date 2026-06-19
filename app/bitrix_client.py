@@ -441,3 +441,98 @@ async def add_deal_task(deal_id: int, title: str,
     except Exception as e:
         logger.error("[bitrix] add_deal_task(%s) failed: %s", deal_id, e)
         return None
+
+
+async def set_deal_title_to_phone(deal_id: int, phone: str, current_title: str = "") -> None:
+    """Назвать сделку номером телефона, если у неё нет осмысленного названия.
+
+    Многие наши сделки приходят как «Сделка #12345» или вовсе без названия —
+    оператору удобнее видеть номер. Переименовываем только если текущее
+    название пустое или похоже на автогенерированное («Сделка #...»).
+    """
+    if not phone:
+        return
+    title = (current_title or "").strip()
+    # переименовываем только автоназвания / пустые
+    looks_auto = (not title) or title.lower().startswith("сделка #") or title.lower().startswith("без названия")
+    if not looks_auto:
+        return
+    url = settings.bitrix_base_url + "crm.deal.update.json"
+    try:
+        await _post(url, {"id": deal_id, "fields": {"TITLE": phone}})
+        logger.info("[bitrix] сделка %s переименована в номер %s", deal_id, phone)
+    except Exception as e:
+        logger.error("[bitrix] set_deal_title_to_phone(%s) failed: %s", deal_id, e)
+
+
+# ─── Назначение ответственного за сделку (по оператору) ──────
+# Запасная таблица sip → Bitrix user ID (на случай если user.search недоступен).
+# Заполнена из реальных данных портала.
+_SIP_TO_BITRIX_ID = {
+    "210": 350,   # Айдана Kazbekova
+    "234": 346,   # Саида Сабина
+    "240": 338,   # Сабина Зуфарова
+}
+
+_sip_id_cache: Dict[str, int] = {}
+
+
+async def _find_bitrix_user_by_sip(sipnumber: str) -> Optional[int]:
+    """Найти Bitrix user ID по внутреннему телефону (UF_PHONE_INNER).
+
+    Сначала кэш, потом запасная таблица, потом API (user.search) через
+    user-webhook. Возвращает ID или None.
+    """
+    if not sipnumber:
+        return None
+    sip = str(sipnumber).strip()
+    if sip in _sip_id_cache:
+        return _sip_id_cache[sip]
+    # запасная таблица — мгновенно и без сети
+    if sip in _SIP_TO_BITRIX_ID:
+        _sip_id_cache[sip] = _SIP_TO_BITRIX_ID[sip]
+        return _SIP_TO_BITRIX_ID[sip]
+    # API-поиск по UF_PHONE_INNER через user-webhook
+    base = settings.BITRIX_USER_WEBHOOK_URL
+    if not base:
+        return None
+    base = base if base.endswith("/") else base + "/"
+    url = base + "user.search.json"
+    try:
+        async with httpx.AsyncClient(timeout=settings.BITRIX_TIMEOUT_SECONDS) as client:
+            r = await client.post(url, json={"UF_PHONE_INNER": sip})
+            r.raise_for_status()
+            data = r.json()
+            users = data.get("result") or []
+            if users:
+                uid = int(users[0].get("ID"))
+                _sip_id_cache[sip] = uid
+                return uid
+    except Exception as e:
+        logger.warning("[bitrix] user.search по sip=%s не удался: %s", sip, e)
+    return None
+
+
+async def assign_deal_responsible(deal_id: int, sipnumber: str) -> bool:
+    """Назначить ответственным за сделку оператора, которому попал звонок.
+
+    Ищет Bitrix user ID по sipnumber, ставит ASSIGNED_BY_ID.
+    Возвращает True если получилось. Никогда не бросает исключение.
+    """
+    uid = await _find_bitrix_user_by_sip(sipnumber)
+    if not uid:
+        logger.info("[bitrix] ответственный не назначен: нет Bitrix ID для sip=%s", sipnumber)
+        return False
+    # обновление через user-webhook (у него есть права), иначе основной
+    base = settings.BITRIX_USER_WEBHOOK_URL or settings.bitrix_base_url
+    base = base if base.endswith("/") else base + "/"
+    url = base + "crm.deal.update.json"
+    try:
+        async with httpx.AsyncClient(timeout=settings.BITRIX_TIMEOUT_SECONDS) as client:
+            r = await client.post(url, json={"id": deal_id, "fields": {"ASSIGNED_BY_ID": uid}})
+            r.raise_for_status()
+        logger.info("[bitrix] сделка %s → ответственный %s (sip=%s)", deal_id, uid, sipnumber)
+        return True
+    except Exception as e:
+        logger.error("[bitrix] assign_deal_responsible(%s, sip=%s) failed: %s", deal_id, sipnumber, e)
+        return False

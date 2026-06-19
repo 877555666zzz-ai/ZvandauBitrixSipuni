@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
-from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status, update_deal_stage
+from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status, update_deal_stage, assign_deal_responsible
 from .config import settings
 from .db import async_session_maker
 from .models import AutodialQueue, CallLog, CallSession, LeadLock, Manager
@@ -731,6 +731,9 @@ async def handle_sipuni_status(
             )
             await add_lead_comment(s.lead_id, comment_text)
             await add_deal_comment(s.lead_id, comment_text)
+            # Назначить оператора ответственным за сделку (тот, кто принял звонок)
+            if s.manager_sipnumber:
+                await assign_deal_responsible(s.lead_id, s.manager_sipnumber)
             if s.manager_id:
                 await _release_after_cooldown(s.manager_id)
             logger.info(

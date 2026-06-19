@@ -36,6 +36,7 @@ from .bitrix_client import (
     find_deal_phone,
     get_deal,
     get_deal_card,
+    set_deal_title_to_phone,
     get_deal_company_phone,
     get_deal_contact_phone,
     get_lead,
@@ -615,6 +616,10 @@ async def bitrix_deal_webhook(
             "[webhook-deal] сделка #%d | телефон=%s | название=%s",
             d_id, phone, meta.get("name"),
         )
+
+        # Если у сделки нет осмысленного названия — назвать её номером
+        # (оператору удобнее видеть номер, а не «Сделка #...»).
+        await set_deal_title_to_phone(d_id, phone, meta.get("name") or "")
 
         # Комментарий «взяли в работу»
         await add_deal_comment(

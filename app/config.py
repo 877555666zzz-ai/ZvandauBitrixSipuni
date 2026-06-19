@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     BITRIX_STAGE_NDZ: str = "C12:PREPARATION"        # НДЗ
     BITRIX_STAGE_NDZ2: str = "C12:UC_DGYTDZ"         # НДЗ 2 (все попытки исчерпаны)
 
+    # Отдельный webhook с правами на пользователей (user.*) — для назначения
+    # ответственного за сделку. Основной BITRIX_WEBHOOK_URL прав user не имеет.
+    # Если не задан — назначение ответственного просто пропускается.
+    BITRIX_USER_WEBHOOK_URL: Optional[str] = None
+
     # ── Telegram-алерты (опционально) ────────────────────────
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
