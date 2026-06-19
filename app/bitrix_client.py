@@ -62,6 +62,26 @@ async def get_deal(deal_id: int) -> dict:
     return await _post(url, {"id": deal_id})
 
 
+async def update_deal_stage(deal_id: int, stage_id: str) -> Optional[dict]:
+    """Перевести сделку в стадию воронки (STAGE_ID, напр. 'C12:PREPARATION').
+
+    Используется чтобы кидать недозвонов в НДЗ / НДЗ 2.
+    Никогда не пробрасывает исключение — если Bitrix недоступен,
+    логируем и возвращаем None, чтобы не ронять обработку звонка.
+    """
+    if not stage_id:
+        return None
+    url = settings.bitrix_base_url + "crm.deal.update.json"
+    try:
+        result = await _post(url, {"id": deal_id, "fields": {"STAGE_ID": stage_id}})
+        logger.info("[bitrix] сделка %s → стадия %s", deal_id, stage_id)
+        return result
+    except Exception as e:
+        logger.error("[bitrix] update_deal_stage(%s, %s) failed: %s",
+                     deal_id, stage_id, e)
+        return None
+
+
 import re
 
 # Минимальная длина номера в цифрах, чтобы считать строку телефоном.
@@ -352,3 +372,72 @@ async def add_lead_comment(lead_id: int, comment: str) -> Optional[dict]:
         except Exception as e2:
             logger.error("[bitrix] add_lead_comment fallback failed: %s", e2)
             return None
+
+# ─── Полная карточка сделки + действия (для портала менеджера) ───
+_STAGE_NAMES_CACHE: Dict[str, str] = {}
+
+
+async def get_deal_card(deal_id: int) -> Dict[str, Any]:
+    """Собрать всё полезное по сделке для показа менеджеру.
+
+    Тянет саму сделку + (при наличии) контакт. Возвращает словарь с
+    именем, телефоном, названием, стадией, источником, суммой, ссылкой.
+    Никогда не бросает исключение — при ошибке возвращает что собралось.
+    """
+    card: Dict[str, Any] = {
+        "deal_id": deal_id, "title": None, "phone": None, "name": None,
+        "stage_id": None, "source": None, "amount": None, "currency": None,
+        "assigned_by": None, "comments": None, "bitrix_url": None,
+    }
+    portal = (settings.BITRIX_PORTAL_URL or "").rstrip("/")
+    if portal:
+        card["bitrix_url"] = f"{portal}/crm/deal/details/{deal_id}/"
+    try:
+        deal = await get_deal(deal_id)
+        result = deal.get("result") or {}
+        card["title"] = (result.get("TITLE") or "").strip() or None
+        card["stage_id"] = result.get("STAGE_ID")
+        card["source"] = result.get("SOURCE_ID")
+        card["amount"] = result.get("OPPORTUNITY")
+        card["currency"] = result.get("CURRENCY_ID")
+        card["assigned_by"] = result.get("ASSIGNED_BY_ID")
+        card["comments"] = (result.get("COMMENTS") or "").strip() or None
+        # телефон — через всеядный поиск
+        card["phone"] = await find_deal_phone(deal)
+        # имя из контакта, если есть
+        cid = result.get("CONTACT_ID")
+        if cid and str(cid) != "0":
+            try:
+                url = settings.bitrix_base_url + "crm.contact.get.json"
+                contact = await _post(url, {"id": cid})
+                c = contact.get("result") or {}
+                parts = [
+                    (c.get("NAME") or "").strip(),
+                    (c.get("LAST_NAME") or "").strip(),
+                ]
+                nm = " ".join(p for p in parts if p)
+                card["name"] = nm or None
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("[bitrix] get_deal_card(%s) failed: %s", deal_id, e)
+    return card
+
+
+async def add_deal_task(deal_id: int, title: str,
+                        responsible_id: Optional[int] = None,
+                        description: str = "") -> Optional[dict]:
+    """Поставить задачу, привязанную к сделке."""
+    url = settings.bitrix_base_url + "tasks.task.add.json"
+    fields: Dict[str, Any] = {
+        "TITLE": title,
+        "DESCRIPTION": description,
+        "UF_CRM_TASK": [f"D_{deal_id}"],  # привязка к сделке
+    }
+    if responsible_id:
+        fields["RESPONSIBLE_ID"] = responsible_id
+    try:
+        return await _post(url, {"fields": fields})
+    except Exception as e:
+        logger.error("[bitrix] add_deal_task(%s) failed: %s", deal_id, e)
+        return None

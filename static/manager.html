@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoCall — рабочее место</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1115; color: #e8eaed; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  .wrap { width: 100%; max-width: 720px; padding: 24px 16px; }
+
+  /* ── Login ── */
+  #login-view { max-width: 360px; margin: 80px auto 0; }
+  .card { background: #1a1d24; border: 1px solid #2a2e37; border-radius: 14px; padding: 24px; }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+  .sub { color: #9aa0aa; font-size: 14px; margin-bottom: 20px; }
+  label { display: block; font-size: 13px; color: #9aa0aa; margin: 14px 0 6px; }
+  input {
+    width: 100%; padding: 12px 14px; font-size: 16px; border-radius: 10px;
+    border: 1px solid #2a2e37; background: #0f1115; color: #e8eaed;
+  }
+  input:focus { outline: none; border-color: #3b82f6; }
+  button {
+    width: 100%; margin-top: 20px; padding: 13px; font-size: 16px; font-weight: 600;
+    border: none; border-radius: 10px; background: #3b82f6; color: #fff; cursor: pointer;
+  }
+  button:hover { background: #2f6fd4; }
+  button.secondary { background: #2a2e37; color: #e8eaed; }
+  button.secondary:hover { background: #353a45; }
+  .error { color: #f87171; font-size: 14px; margin-top: 12px; min-height: 18px; }
+
+  /* ── Work view ── */
+  #work-view { display: none; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .topbar .who { font-size: 16px; font-weight: 600; }
+  .topbar .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .online { background: #34d399; }
+  .offline { background: #6b7280; }
+  .logout-btn { width: auto; margin: 0; padding: 8px 14px; font-size: 13px; background: #2a2e37; }
+
+  .idle { text-align: center; padding: 60px 20px; color: #6b7280; }
+  .idle .pulse { font-size: 15px; }
+
+  /* ── Call card ── */
+  #call-card { display: none; }
+  .ringing { border-color: #3b82f6; animation: ring 1.2s ease-in-out infinite; }
+  .connected { border-color: #34d399; }
+  @keyframes ring { 0%,100% { box-shadow: 0 0 0 0 rgba(59,130,246,.4);} 50% { box-shadow: 0 0 0 8px rgba(59,130,246,0);} }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-bottom: 14px; }
+  .badge.ring { background: #1e3a5f; color: #93c5fd; }
+  .badge.conn { background: #14432e; color: #6ee7b7; }
+  .client-name { font-size: 24px; font-weight: 600; margin-bottom: 2px; }
+  .client-phone { font-size: 18px; color: #9aa0aa; margin-bottom: 18px; }
+  .fields { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; font-size: 14px; margin-bottom: 18px; }
+  .fields .k { color: #6b7280; }
+  .fields .v { color: #e8eaed; }
+  .actions { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+  .row { display: flex; gap: 10px; }
+  .row button, .row select { flex: 1; margin: 0; }
+  select {
+    padding: 12px 14px; font-size: 15px; border-radius: 10px;
+    border: 1px solid #2a2e37; background: #0f1115; color: #e8eaed;
+  }
+  textarea {
+    width: 100%; padding: 12px 14px; font-size: 15px; border-radius: 10px; resize: vertical;
+    border: 1px solid #2a2e37; background: #0f1115; color: #e8eaed; min-height: 70px; font-family: inherit;
+  }
+  .open-bx { background: #2a2e37; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: #14432e; color: #6ee7b7; padding: 12px 20px; border-radius: 10px;
+    font-size: 14px; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.err { background: #4a1515; color: #fca5a5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- LOGIN -->
+  <div id="login-view">
+    <div class="card">
+      <h1>AutoCall</h1>
+      <div class="sub">Рабочее место оператора</div>
+      <label>Логин</label>
+      <input id="login" autocomplete="username" autocapitalize="off">
+      <label>Пароль</label>
+      <input id="password" type="password" autocomplete="current-password">
+      <button onclick="doLogin()">Войти</button>
+      <div class="error" id="login-error"></div>
+    </div>
+  </div>
+
+  <!-- WORK -->
+  <div id="work-view">
+    <div class="topbar">
+      <div>
+        <div class="who" id="who"></div>
+        <div style="font-size:13px;color:#9aa0aa;margin-top:2px">
+          <span class="status-dot" id="status-dot"></span><span id="status-text"></span>
+        </div>
+      </div>
+      <button class="logout-btn" onclick="doLogout()">Выйти</button>
+    </div>
+
+    <div id="idle" class="idle">
+      <div class="pulse">Ожидание звонка…</div>
+      <div style="font-size:13px;margin-top:8px">Когда поступит лид — здесь появится карточка клиента</div>
+    </div>
+
+    <div id="call-card" class="card">
+      <span class="badge" id="call-badge"></span>
+      <div class="client-name" id="c-name"></div>
+      <div class="client-phone" id="c-phone"></div>
+      <div class="fields" id="c-fields"></div>
+
+      <div class="actions">
+        <div class="row">
+          <select id="stage-select"></select>
+          <button onclick="changeStage()">Сменить стадию</button>
+        </div>
+        <textarea id="comment-text" placeholder="Комментарий к сделке…"></textarea>
+        <div class="row">
+          <button onclick="addComment()">Сохранить коммент</button>
+          <button class="secondary" onclick="addTask()">Поставить задачу</button>
+        </div>
+        <button class="open-bx" onclick="openBitrix()">Открыть в Bitrix</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let ME = null;
+let CURRENT_LEAD = null;
+let POLL = null;
+
+const STAGES = [
+  {id:"C12:NEW", name:"Тёплые лиды"},
+  {id:"C12:PREPARATION", name:"НДЗ"},
+  {id:"C12:UC_DGYTDZ", name:"НДЗ 2"},
+  {id:"C12:PREPAYMENT_INVOIC", name:"ПЕРЕЗВОНИТЬ"},
+  {id:"C12:EXECUTING", name:"ХОЛОД"},
+  {id:"C12:UC_CYJM1D", name:"Ссылка на рег"},
+  {id:"C12:UC_H47LCY", name:"Ссылка на регу НДЗ"},
+  {id:"C12:UC_0QXBHN", name:"КП"},
+  {id:"C12:UC_XCF40E", name:"Создан"},
+  {id:"C12:UC_LG27SJ", name:"Приглашен в хаб"},
+  {id:"C12:UC_GLR1Y1", name:"отправил промо"},
+  {id:"C12:FINAL_INVOICE", name:"Активирован"},
+  {id:"C12:WON", name:"Сделка успешна"},
+  {id:"C12:LOSE", name:"Сделка провалена"},
+  {id:"C12:APOLOGY", name:"Анализ причины провала"},
+];
+
+function toast(msg, isErr) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast show' + (isErr ? ' err' : '');
+  setTimeout(() => t.className = 'toast', 2500);
+}
+
+async function doLogin() {
+  const login = document.getElementById('login').value.trim();
+  const password = document.getElementById('password').value;
+  const err = document.getElementById('login-error');
+  err.textContent = '';
+  try {
+    const r = await fetch('/manager/api/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({login, password})
+    });
+    if (!r.ok) { err.textContent = 'Неверный логин или пароль'; return; }
+    const data = await r.json();
+    ME = data;
+    showWork();
+  } catch(e) { err.textContent = 'Ошибка соединения'; }
+}
+
+async function doLogout() {
+  try { await fetch('/manager/api/logout', {method:'POST'}); } catch(e){}
+  if (POLL) clearInterval(POLL);
+  ME = null; CURRENT_LEAD = null;
+  document.getElementById('work-view').style.display='none';
+  document.getElementById('login-view').style.display='block';
+  document.getElementById('password').value='';
+}
+
+function showWork() {
+  document.getElementById('login-view').style.display='none';
+  document.getElementById('work-view').style.display='block';
+  document.getElementById('who').textContent = ME.name + ' · доб. ' + ME.sipnumber;
+  const dot = document.getElementById('status-dot');
+  const st = document.getElementById('status-text');
+  dot.className = 'status-dot ' + (ME.online ? 'online' : 'offline');
+  st.textContent = ME.online ? 'На линии' : 'Не на линии';
+  const sel = document.getElementById('stage-select');
+  sel.innerHTML = STAGES.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+  startPolling();
+}
+
+function startPolling() {
+  if (POLL) clearInterval(POLL);
+  pollCall();
+  POLL = setInterval(pollCall, 2000);
+}
+
+async function pollCall() {
+  try {
+    const r = await fetch('/manager/api/current-call');
+    if (r.status === 401) { doLogout(); return; }
+    const data = await r.json();
+    if (data && data.lead_id) {
+      showCall(data);
+    } else {
+      hideCall();
+    }
+  } catch(e) {}
+}
+
+let LAST_LEAD = null;
+async function showCall(call) {
+  document.getElementById('idle').style.display='none';
+  const card = document.getElementById('call-card');
+  card.style.display='block';
+  card.className = 'card ' + (call.connected ? 'connected' : 'ringing');
+  const badge = document.getElementById('call-badge');
+  badge.className = 'badge ' + (call.connected ? 'conn' : 'ring');
+  badge.textContent = call.connected ? '● Соединён' : '● Звонок…';
+
+  if (LAST_LEAD === call.lead_id) {
+    document.getElementById('c-phone').textContent = call.phone || '';
+    return;
+  }
+  LAST_LEAD = call.lead_id;
+  CURRENT_LEAD = call.lead_id;
+  document.getElementById('c-phone').textContent = call.phone || '';
+  document.getElementById('c-name').textContent = 'Загрузка…';
+  document.getElementById('c-fields').innerHTML = '';
+
+  try {
+    const r = await fetch('/manager/api/card/' + call.lead_id);
+    const c = await r.json();
+    document.getElementById('c-name').textContent = c.name || c.title || 'Клиент';
+    document.getElementById('c-phone').textContent = c.phone || call.phone || '';
+    const f = [];
+    if (c.title) f.push(['Сделка', c.title]);
+    if (c.amount) f.push(['Сумма', c.amount + ' ' + (c.currency||'')]);
+    if (c.source) f.push(['Источник', c.source]);
+    if (c.comments) f.push(['Заметки', c.comments]);
+    document.getElementById('c-fields').innerHTML =
+      f.map(([k,v]) => `<div class="k">${k}</div><div class="v">${escapeHtml(v)}</div>`).join('');
+    if (c.stage_id) document.getElementById('stage-select').value = c.stage_id;
+  } catch(e) {
+    document.getElementById('c-name').textContent = 'Клиент';
+  }
+}
+
+function hideCall() {
+  document.getElementById('call-card').style.display='none';
+  document.getElementById('idle').style.display='block';
+  LAST_LEAD = null; CURRENT_LEAD = null;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function changeStage() {
+  if (!CURRENT_LEAD) return;
+  const stage = document.getElementById('stage-select').value;
+  try {
+    const r = await fetch('/manager/api/action/stage', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({lead_id: CURRENT_LEAD, stage_id: stage})
+    });
+    toast(r.ok ? 'Стадия изменена' : 'Ошибка', !r.ok);
+  } catch(e) { toast('Ошибка соединения', true); }
+}
+
+async function addComment() {
+  if (!CURRENT_LEAD) return;
+  const text = document.getElementById('comment-text').value.trim();
+  if (!text) { toast('Введите комментарий', true); return; }
+  try {
+    const r = await fetch('/manager/api/action/comment', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({lead_id: CURRENT_LEAD, text})
+    });
+    if (r.ok) { document.getElementById('comment-text').value=''; toast('Комментарий сохранён'); }
+    else toast('Ошибка', true);
+  } catch(e) { toast('Ошибка соединения', true); }
+}
+
+async function addTask() {
+  if (!CURRENT_LEAD) return;
+  const text = document.getElementById('comment-text').value.trim() || 'Связаться с клиентом';
+  try {
+    const r = await fetch('/manager/api/action/task', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({lead_id: CURRENT_LEAD, title: text})
+    });
+    toast(r.ok ? 'Задача поставлена' : 'Ошибка', !r.ok);
+  } catch(e) { toast('Ошибка соединения', true); }
+}
+
+function openBitrix() {
+  if (!CURRENT_LEAD) return;
+  fetch('/manager/api/card/' + CURRENT_LEAD).then(r=>r.json()).then(c => {
+    if (c.bitrix_url) window.open(c.bitrix_url, '_blank');
+    else toast('Ссылка недоступна', true);
+  });
+}
+
+// автологин если сессия жива
+(async function() {
+  try {
+    const r = await fetch('/manager/api/me');
+    if (r.ok) { ME = await r.json(); showWork(); }
+  } catch(e) {}
+})();
+
+document.getElementById('password').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+</script>
+</body>
+</html>

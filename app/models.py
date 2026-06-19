@@ -32,6 +32,11 @@ class Manager(Base):
     name = Column(String, nullable=False)
     sipnumber = Column(String, nullable=False)
 
+    # Вход на личную страницу менеджера: логин уникален, пароль — хэш.
+    # NULL = у менеджера ещё нет доступа к личной странице.
+    login = Column(String, nullable=True, unique=True, index=True)
+    password_hash = Column(String, nullable=True)
+
     online = Column(Boolean, default=True, nullable=False)
     missed = Column(Integer, default=0, nullable=False)
     accepted_calls = Column(Integer, default=0, nullable=False)
@@ -176,3 +181,18 @@ class LeadLock(Base):
 
     lead_id = Column(Integer, primary_key=True)  # PK = уникальность = атомарность
     acquired_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+# ─────────────────────────────────────────────
+class ManagerSession(Base):
+    """Сессия входа менеджера на личную страницу.
+
+    Менеджер логинится по логину/паролю → создаётся сессия с токеном,
+    токен кладётся в cookie. Страница и её API ходят с этим токеном.
+    Сессия живёт до явного выхода или истечения TTL.
+    """
+    __tablename__ = "manager_sessions"
+
+    token = Column(String, primary_key=True)       # случайный токен сессии
+    manager_id = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen = Column(DateTime, default=datetime.utcnow, nullable=False)

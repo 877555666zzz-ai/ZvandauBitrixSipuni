@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # по URL вида /manager/{id}?token=...  если задан MANAGER_PAGE_TOKEN.
     MANAGER_PAGE_TOKEN: Optional[str] = None
 
+    # ── Стадии воронки «Яндекс 360» (category 12) ────────────
+    # Недозвоны кидаем в НДЗ; после исчерпания всех попыток — в НДЗ 2.
+    BITRIX_STAGE_NDZ: str = "C12:PREPARATION"        # НДЗ
+    BITRIX_STAGE_NDZ2: str = "C12:UC_DGYTDZ"         # НДЗ 2 (все попытки исчерпаны)
+
     # ── Telegram-алерты (опционально) ────────────────────────
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None

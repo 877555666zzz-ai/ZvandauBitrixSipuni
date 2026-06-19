@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
-from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status
+from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status, update_deal_stage
 from .config import settings
 from .db import async_session_maker
 from .models import AutodialQueue, CallLog, CallSession, LeadLock, Manager
@@ -340,6 +340,8 @@ async def schedule_autodial(
             message=f"Не дозвонились после {settings.MAX_AUTODIAL_ATTEMPTS} попыток",
         )
         await update_lead_status(lead_id, "failed")
+        # Все попытки исчерпаны, лид так и не ответил → стадия НДЗ 2
+        await update_deal_stage(lead_id, settings.BITRIX_STAGE_NDZ2)
         await add_lead_comment(
             lead_id,
             f"Автодозвон: не удалось связаться после "
@@ -796,6 +798,8 @@ async def handle_sipuni_status(
             s.lead_id, s.phone, current_attempts=s.attempts_used,
         )
         await update_lead_status(s.lead_id, "retry")
+        # Клиент не ответил, но попытки ещё есть → стадия НДЗ
+        await update_deal_stage(s.lead_id, settings.BITRIX_STAGE_NDZ)
         await add_lead_comment(
             s.lead_id,
             f"Все операторы не ответили/заняты. Лид поставлен в автодозвон "

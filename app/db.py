@@ -41,13 +41,24 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE managers ADD COLUMN IF NOT EXISTS busy_until TIMESTAMP"
             ))
+            await conn.execute(text(
+                "ALTER TABLE managers ADD COLUMN IF NOT EXISTS login VARCHAR"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE managers ADD COLUMN IF NOT EXISTS password_hash VARCHAR"
+            ))
         else:
-            try:
-                await conn.execute(text(
-                    "ALTER TABLE managers ADD COLUMN busy_until TIMESTAMP"
-                ))
-            except Exception:
-                pass  # колонка уже есть
+            for col, typ in (
+                ("busy_until", "TIMESTAMP"),
+                ("login", "VARCHAR"),
+                ("password_hash", "VARCHAR"),
+            ):
+                try:
+                    await conn.execute(text(
+                        f"ALTER TABLE managers ADD COLUMN {col} {typ}"
+                    ))
+                except Exception:
+                    pass  # колонка уже есть
 
         # При старте сервиса сбрасываем «занятость» менеджеров и снимаем все
         # блокировки лидов: после рестарта старые звонки уже не активны, а

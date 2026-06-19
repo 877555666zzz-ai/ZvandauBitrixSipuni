@@ -10,11 +10,13 @@ from typing import Optional
 
 from fastapi import (
     BackgroundTasks,
+    Cookie,
     Depends,
     FastAPI,
     HTTPException,
     Query,
     Request,
+    Response,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,15 +28,18 @@ from sqlalchemy import desc, func, select
 
 from .bitrix_client import (
     add_deal_comment,
+    add_deal_task,
     extract_deal_meta,
     extract_lead_meta,
     extract_phone,
     extract_phone_from_deal,
     find_deal_phone,
     get_deal,
+    get_deal_card,
     get_deal_company_phone,
     get_deal_contact_phone,
     get_lead,
+    update_deal_stage,
 )
 from .config import settings
 from .db import async_session_maker, init_db
@@ -45,6 +50,7 @@ from .dispatcher import (
     process_new_lead,
 )
 from .models import AutodialQueue, CallLog, CallSession, Manager
+from . import manager_portal as portal
 from .sipuni_client import make_outbound_call, parse_sipuni_webhook
 
 logging.basicConfig(
@@ -789,6 +795,122 @@ refresh();
 setInterval(refresh,15000);
 </script>
 </body></html>"""
+
+
+@app.get("/manager", response_class=HTMLResponse, include_in_schema=False)
+async def manager_portal_page():
+    """Единая страница портала: вход → рабочий экран."""
+    path = os.path.join("static", "manager.html")
+    if os.path.exists(path):
+        return FileResponse(path)
+    return HTMLResponse("<h1>manager.html не найден</h1>", status_code=500)
+
+
+class PortalLogin(BaseModel):
+    login: str
+    password: str
+
+
+def _mgr_public(m: Manager) -> dict:
+    return {"id": m.id, "name": m.name, "sipnumber": m.sipnumber,
+            "online": bool(m.online)}
+
+
+@app.post("/manager/api/login", include_in_schema=False)
+async def portal_login(data: PortalLogin, response: Response):
+    mgr = await portal.authenticate(data.login, data.password)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="bad credentials")
+    token = await portal.create_session(mgr.id)
+    response.set_cookie(
+        "mgr_session", token, httponly=True, samesite="lax",
+        max_age=portal.SESSION_TTL_HOURS * 3600,
+    )
+    return _mgr_public(mgr)
+
+
+@app.post("/manager/api/logout", include_in_schema=False)
+async def portal_logout(response: Response,
+                        mgr_session: Optional[str] = Cookie(default=None)):
+    await portal.destroy_session(mgr_session)
+    response.delete_cookie("mgr_session")
+    return {"ok": True}
+
+
+@app.get("/manager/api/me", include_in_schema=False)
+async def portal_me(mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    return _mgr_public(mgr)
+
+
+@app.get("/manager/api/current-call", include_in_schema=False)
+async def portal_current_call(mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    call = await portal.get_current_call(mgr.id)
+    return call or {}
+
+
+@app.get("/manager/api/card/{lead_id}", include_in_schema=False)
+async def portal_card(lead_id: int,
+                      mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    return await get_deal_card(lead_id)
+
+
+class PortalStage(BaseModel):
+    lead_id: int
+    stage_id: str
+
+
+class PortalComment(BaseModel):
+    lead_id: int
+    text: str
+
+
+class PortalTask(BaseModel):
+    lead_id: int
+    title: str
+
+
+@app.post("/manager/api/action/stage", include_in_schema=False)
+async def portal_action_stage(data: PortalStage,
+                              mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    res = await update_deal_stage(data.lead_id, data.stage_id)
+    await add_deal_comment(
+        data.lead_id, f"Оператор {mgr.name} сменил стадию вручную."
+    )
+    return {"ok": res is not None}
+
+
+@app.post("/manager/api/action/comment", include_in_schema=False)
+async def portal_action_comment(data: PortalComment,
+                                mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    res = await add_deal_comment(
+        data.lead_id, f"[{mgr.name}] {data.text}"
+    )
+    return {"ok": res is not None}
+
+
+@app.post("/manager/api/action/task", include_in_schema=False)
+async def portal_action_task(data: PortalTask,
+                             mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    res = await add_deal_task(data.lead_id, data.title)
+    return {"ok": res is not None}
 
 
 @app.get("/manager/{manager_id}", response_class=HTMLResponse, include_in_schema=False)
