@@ -1,89 +1,184 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AutoCall — рабочее место</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg1:#0c1322; --bg2:#111a2e; --bg3:#0a1f2e;
+    --surface:rgba(255,255,255,0.05); --surface-solid:#161d2e;
+    --border:rgba(255,255,255,0.10); --border-strong:rgba(255,255,255,0.18);
+    --text:#eef1f7; --text-dim:#9aa3b6; --text-faint:#6b7488;
+    --accent:#4f8ff7; --accent-h:#3f7de0;
+    --green:#34d399; --green-bg:rgba(52,211,153,0.14);
+    --amber:#fbbf24; --red:#f87171;
+    --blue-bg:rgba(79,143,247,0.16); --blue-tx:#9cc2ff;
+    --field:rgba(255,255,255,0.04); --field-bd:rgba(255,255,255,0.12);
+    --shadow:0 18px 50px rgba(0,0,0,0.45);
+  }
+  [data-theme="light"] {
+    --bg1:#eef2fb; --bg2:#e3ebfa; --bg3:#f3f0fb;
+    --surface:rgba(255,255,255,0.72); --surface-solid:#ffffff;
+    --border:rgba(20,30,60,0.10); --border-strong:rgba(20,30,60,0.16);
+    --text:#16203a; --text-dim:#5a647c; --text-faint:#8b93a7;
+    --accent:#2f6fe0; --accent-h:#245ec4;
+    --green:#0f9d6b; --green-bg:rgba(15,157,107,0.12);
+    --amber:#b97e09; --red:#d6453f;
+    --blue-bg:rgba(47,111,224,0.10); --blue-tx:#2f6fe0;
+    --field:rgba(20,30,60,0.04); --field-bd:rgba(20,30,60,0.14);
+    --shadow:0 18px 50px rgba(40,60,110,0.18);
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: #0f1115; color: #e8eaed; min-height: 100vh;
-    display: flex; flex-direction: column; align-items: center;
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+    color:var(--text); min-height:100vh; position:relative; overflow-x:hidden; transition:color .4s;
   }
-  .wrap { width: 100%; max-width: 720px; padding: 24px 16px; }
-
-  /* ── Login ── */
-  #login-view { max-width: 360px; margin: 80px auto 0; }
-  .card { background: #1a1d24; border: 1px solid #2a2e37; border-radius: 14px; padding: 24px; }
-  h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
-  .sub { color: #9aa0aa; font-size: 14px; margin-bottom: 20px; }
-  label { display: block; font-size: 13px; color: #9aa0aa; margin: 14px 0 6px; }
-  input {
-    width: 100%; padding: 12px 14px; font-size: 16px; border-radius: 10px;
-    border: 1px solid #2a2e37; background: #0f1115; color: #e8eaed;
+  body::before {
+    content:''; position:fixed; inset:-30%; z-index:-2;
+    background:
+      radial-gradient(40% 40% at 20% 25%, var(--bg2) 0%, transparent 60%),
+      radial-gradient(45% 45% at 80% 20%, var(--bg3) 0%, transparent 55%),
+      radial-gradient(50% 50% at 60% 85%, var(--bg2) 0%, transparent 60%),
+      var(--bg1);
+    background-size:200% 200%,200% 200%,200% 200%,100% 100%;
+    animation:drift 22s ease-in-out infinite; transition:background .5s;
   }
-  input:focus { outline: none; border-color: #3b82f6; }
+  @keyframes drift {
+    0%,100% { background-position:0% 0%,100% 0%,50% 100%,0 0; }
+    50% { background-position:30% 40%,70% 30%,40% 60%,0 0; }
+  }
+  @media (prefers-reduced-motion:reduce){ body::before{animation:none;} }
+  .wrap { width:100%; max-width:760px; margin:0 auto; padding:22px 18px 60px; }
+  .glass {
+    background:var(--surface); border:1px solid var(--border); border-radius:20px;
+    box-shadow:var(--shadow); backdrop-filter:blur(18px) saturate(140%);
+    -webkit-backdrop-filter:blur(18px) saturate(140%);
+  }
+  /* Login */
+  #login-view { max-width:380px; margin:9vh auto 0; }
+  .login-card { padding:30px 28px; }
+  .brand { display:flex; align-items:center; gap:10px; margin-bottom:4px; }
+  .brand .dot { width:11px; height:11px; border-radius:50%;
+    background:linear-gradient(135deg,var(--accent),var(--green)); box-shadow:0 0 14px var(--accent); }
+  h1 { font-size:23px; font-weight:700; letter-spacing:-0.4px; }
+  .sub { color:var(--text-dim); font-size:14px; margin-bottom:22px; }
+  label { display:block; font-size:12.5px; color:var(--text-dim); margin:15px 0 7px; font-weight:500; }
+  input,select,textarea {
+    width:100%; padding:13px 15px; font-size:15.5px; border-radius:13px;
+    border:1px solid var(--field-bd); background:var(--field); color:var(--text);
+    font-family:inherit; transition:border-color .2s;
+  }
+  input:focus,select:focus,textarea:focus { outline:none; border-color:var(--accent); }
+  textarea { min-height:76px; resize:vertical; }
   button {
-    width: 100%; margin-top: 20px; padding: 13px; font-size: 16px; font-weight: 600;
-    border: none; border-radius: 10px; background: #3b82f6; color: #fff; cursor: pointer;
+    width:100%; margin-top:22px; padding:13px; font-size:15.5px; font-weight:600;
+    border:none; border-radius:13px; background:var(--accent); color:#fff; cursor:pointer;
+    transition:background .2s,transform .08s; box-shadow:0 6px 18px rgba(79,143,247,0.28);
   }
-  button:hover { background: #2f6fd4; }
-  button.secondary { background: #2a2e37; color: #e8eaed; }
-  button.secondary:hover { background: #353a45; }
-  .error { color: #f87171; font-size: 14px; margin-top: 12px; min-height: 18px; }
-
-  /* ── Work view ── */
-  #work-view { display: none; }
-  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-  .topbar .who { font-size: 16px; font-weight: 600; }
-  .topbar .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .online { background: #34d399; }
-  .offline { background: #6b7280; }
-  .logout-btn { width: auto; margin: 0; padding: 8px 14px; font-size: 13px; background: #2a2e37; }
-
-  .idle { text-align: center; padding: 60px 20px; color: #6b7280; }
-  .idle .pulse { font-size: 15px; }
-
-  /* ── Call card ── */
-  #call-card { display: none; }
-  .ringing { border-color: #3b82f6; animation: ring 1.2s ease-in-out infinite; }
-  .connected { border-color: #34d399; }
-  @keyframes ring { 0%,100% { box-shadow: 0 0 0 0 rgba(59,130,246,.4);} 50% { box-shadow: 0 0 0 8px rgba(59,130,246,0);} }
-  .badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-bottom: 14px; }
-  .badge.ring { background: #1e3a5f; color: #93c5fd; }
-  .badge.conn { background: #14432e; color: #6ee7b7; }
-  .client-name { font-size: 24px; font-weight: 600; margin-bottom: 2px; }
-  .client-phone { font-size: 18px; color: #9aa0aa; margin-bottom: 18px; }
-  .fields { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; font-size: 14px; margin-bottom: 18px; }
-  .fields .k { color: #6b7280; }
-  .fields .v { color: #e8eaed; }
-  .actions { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
-  .row { display: flex; gap: 10px; }
-  .row button, .row select { flex: 1; margin: 0; }
-  select {
-    padding: 12px 14px; font-size: 15px; border-radius: 10px;
-    border: 1px solid #2a2e37; background: #0f1115; color: #e8eaed;
-  }
-  textarea {
-    width: 100%; padding: 12px 14px; font-size: 15px; border-radius: 10px; resize: vertical;
-    border: 1px solid #2a2e37; background: #0f1115; color: #e8eaed; min-height: 70px; font-family: inherit;
-  }
-  .open-bx { background: #2a2e37; }
-  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-    background: #14432e; color: #6ee7b7; padding: 12px 20px; border-radius: 10px;
-    font-size: 14px; opacity: 0; transition: opacity .3s; pointer-events: none; }
-  .toast.show { opacity: 1; }
-  .toast.err { background: #4a1515; color: #fca5a5; }
+  button:hover { background:var(--accent-h); }
+  button:active { transform:translateY(1px); }
+  button.ghost { background:var(--field); color:var(--text); box-shadow:none; border:1px solid var(--field-bd); }
+  button.ghost:hover { background:var(--surface); }
+  .error { color:var(--red); font-size:13.5px; margin-top:13px; min-height:18px; }
+  /* Work */
+  #work-view { display:none; animation:rise .5s ease-out; }
+  @keyframes rise { from{opacity:0;transform:translateY(14px);} to{opacity:1;transform:translateY(0);} }
+  .topbar { display:flex; justify-content:space-between; align-items:center; padding:16px 20px; margin-bottom:16px; }
+  .who { font-size:16px; font-weight:600; letter-spacing:-0.2px; }
+  .status { font-size:13px; color:var(--text-dim); margin-top:3px; display:flex; align-items:center; gap:7px; }
+  .status-dot { width:8px; height:8px; border-radius:50%; }
+  .online { background:var(--green); box-shadow:0 0 10px var(--green); }
+  .offline { background:var(--text-faint); }
+  .top-actions { display:flex; gap:9px; align-items:center; }
+  .icon-btn { width:auto; margin:0; padding:9px 11px; font-size:15px; background:var(--field);
+    color:var(--text); border:1px solid var(--field-bd); box-shadow:none; border-radius:11px; line-height:1; }
+  .icon-btn:hover { background:var(--surface); }
+  .logout-btn { width:auto; margin:0; padding:9px 15px; font-size:13.5px; background:var(--field);
+    color:var(--text); border:1px solid var(--field-bd); box-shadow:none; border-radius:11px; }
+  .logout-btn:hover { background:var(--surface); }
+  /* Tabs */
+  .tabs { display:flex; gap:6px; padding:6px; margin-bottom:16px; }
+  .tab { flex:1; margin:0; padding:11px; font-size:14px; font-weight:500; background:transparent;
+    color:var(--text-dim); box-shadow:none; border-radius:13px; }
+  .tab:hover { background:var(--field); color:var(--text); }
+  .tab.active { background:var(--accent); color:#fff; box-shadow:0 4px 14px rgba(79,143,247,0.3); }
+  .panel { display:none; }
+  .panel.active { display:block; animation:rise .35s ease-out; }
+  /* idle */
+  .idle { text-align:center; padding:80px 20px; }
+  .idle .ring { width:56px; height:56px; margin:0 auto 22px; border-radius:50%; border:2px solid var(--border-strong); position:relative; }
+  .idle .ring::after { content:''; position:absolute; inset:-2px; border-radius:50%; border:2px solid transparent; border-top-color:var(--accent); animation:spin 1.4s linear infinite; }
+  @keyframes spin { to{transform:rotate(360deg);} }
+  .idle .t1 { font-size:16px; font-weight:500; }
+  .idle .t2 { font-size:13.5px; color:var(--text-dim); margin-top:8px; }
+  /* call card */
+  #call-card { display:none; padding:26px; }
+  .ringing { border-color:var(--accent)!important; animation:glow 1.6s ease-in-out infinite; }
+  .connected { border-color:var(--green)!important; }
+  @keyframes glow { 0%,100%{box-shadow:var(--shadow),0 0 0 0 rgba(79,143,247,.35);} 50%{box-shadow:var(--shadow),0 0 0 9px rgba(79,143,247,0);} }
+  .badge { display:inline-flex; align-items:center; gap:7px; padding:6px 13px; border-radius:30px; font-size:12.5px; font-weight:600; margin-bottom:16px; }
+  .badge .bd { width:7px; height:7px; border-radius:50%; }
+  .badge.ring { background:var(--blue-bg); color:var(--blue-tx); }
+  .badge.ring .bd { background:var(--accent); animation:blink 1s infinite; }
+  .badge.conn { background:var(--green-bg); color:var(--green); }
+  .badge.conn .bd { background:var(--green); }
+  @keyframes blink { 50%{opacity:.35;} }
+  .client-name { font-size:26px; font-weight:700; letter-spacing:-0.5px; margin-bottom:3px; }
+  .client-phone { font-size:18px; color:var(--text-dim); margin-bottom:20px; font-variant-numeric:tabular-nums; }
+  .fields { display:grid; grid-template-columns:auto 1fr; gap:9px 18px; font-size:14px; margin-bottom:22px; }
+  .fields .k { color:var(--text-faint); }
+  .fields .v { color:var(--text); }
+  .divider { height:1px; background:var(--border); margin:4px 0 20px; }
+  .actions { display:flex; flex-direction:column; gap:11px; }
+  .row { display:flex; gap:11px; }
+  .row > * { flex:1; margin:0; }
+  .open-bx { background:var(--field); color:var(--text); border:1px solid var(--field-bd); box-shadow:none; }
+  .open-bx:hover { background:var(--surface); }
+  /* leads list */
+  .lead-item { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--border); cursor:pointer; transition:background .15s; }
+  .lead-item:last-child { border-bottom:none; }
+  .lead-item:hover { background:var(--field); }
+  .lead-l .ph { font-size:15px; font-weight:500; font-variant-numeric:tabular-nums; }
+  .lead-l .nm { font-size:13px; color:var(--text-dim); margin-top:2px; }
+  .lead-r { text-align:right; }
+  .pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:11.5px; font-weight:600; }
+  .pill.green { background:var(--green-bg); color:var(--green); }
+  .pill.amber { background:rgba(251,191,36,0.14); color:var(--amber); }
+  .pill.red { background:rgba(248,113,113,0.14); color:var(--red); }
+  .pill.gray { background:var(--field); color:var(--text-dim); }
+  .lead-r .tm { font-size:11.5px; color:var(--text-faint); margin-top:4px; }
+  .empty { text-align:center; padding:60px 20px; color:var(--text-dim); font-size:14px; }
+  /* profile */
+  .prof-head { padding:24px; text-align:center; margin-bottom:14px; }
+  .avatar { width:64px; height:64px; border-radius:50%; margin:0 auto 14px;
+    background:linear-gradient(135deg,var(--accent),var(--green)); display:flex; align-items:center; justify-content:center;
+    font-size:26px; font-weight:700; color:#fff; }
+  .prof-name { font-size:20px; font-weight:700; }
+  .prof-sip { font-size:13.5px; color:var(--text-dim); margin-top:3px; }
+  .stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .stat { padding:20px; text-align:center; }
+  .stat .num { font-size:30px; font-weight:700; letter-spacing:-1px; }
+  .stat .lbl { font-size:12.5px; color:var(--text-dim); margin-top:5px; }
+  .stat.accent .num { color:var(--accent); }
+  .stat.green .num { color:var(--green); }
+  .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(10px);
+    background:var(--surface-solid); color:var(--text); padding:13px 22px; border-radius:13px; font-size:14px;
+    opacity:0; transition:opacity .3s,transform .3s; pointer-events:none; box-shadow:var(--shadow); border:1px solid var(--border); }
+  .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  .toast.ok { border-left:3px solid var(--green); }
+  .toast.err { border-left:3px solid var(--red); }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <!-- LOGIN -->
   <div id="login-view">
-    <div class="card">
-      <h1>AutoCall</h1>
+    <div class="glass login-card">
+      <div class="brand"><span class="dot"></span><h1>AutoCall</h1></div>
       <div class="sub">Рабочее место оператора</div>
       <label>Логин</label>
       <input id="login" autocomplete="username" autocapitalize="off">
@@ -94,41 +189,65 @@
     </div>
   </div>
 
-  <!-- WORK -->
   <div id="work-view">
-    <div class="topbar">
+    <div class="glass topbar">
       <div>
         <div class="who" id="who"></div>
-        <div style="font-size:13px;color:#9aa0aa;margin-top:2px">
-          <span class="status-dot" id="status-dot"></span><span id="status-text"></span>
-        </div>
+        <div class="status"><span class="status-dot" id="status-dot"></span><span id="status-text"></span></div>
       </div>
-      <button class="logout-btn" onclick="doLogout()">Выйти</button>
+      <div class="top-actions">
+        <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" title="Тема">☾</button>
+        <button class="logout-btn" onclick="doLogout()">Выйти</button>
+      </div>
     </div>
 
-    <div id="idle" class="idle">
-      <div class="pulse">Ожидание звонка…</div>
-      <div style="font-size:13px;margin-top:8px">Когда поступит лид — здесь появится карточка клиента</div>
+    <div class="glass tabs">
+      <button class="tab active" data-tab="call" onclick="switchTab('call')">Звонок</button>
+      <button class="tab" data-tab="leads" onclick="switchTab('leads')">Мои лиды</button>
+      <button class="tab" data-tab="profile" onclick="switchTab('profile')">Профиль</button>
     </div>
 
-    <div id="call-card" class="card">
-      <span class="badge" id="call-badge"></span>
-      <div class="client-name" id="c-name"></div>
-      <div class="client-phone" id="c-phone"></div>
-      <div class="fields" id="c-fields"></div>
-
-      <div class="actions">
-        <div class="row">
-          <select id="stage-select"></select>
-          <button onclick="changeStage()">Сменить стадию</button>
-        </div>
-        <textarea id="comment-text" placeholder="Комментарий к сделке…"></textarea>
-        <div class="row">
-          <button onclick="addComment()">Сохранить коммент</button>
-          <button class="secondary" onclick="addTask()">Поставить задачу</button>
-        </div>
-        <button class="open-bx" onclick="openBitrix()">Открыть в Bitrix</button>
+    <!-- TAB: CALL -->
+    <div class="panel active" id="panel-call">
+      <div id="idle" class="glass idle">
+        <div class="ring"></div>
+        <div class="t1">Ожидание звонка</div>
+        <div class="t2">Когда поступит лид — здесь появится карточка клиента</div>
       </div>
+      <div id="call-card" class="glass">
+        <span class="badge" id="call-badge"></span>
+        <div class="client-name" id="c-name"></div>
+        <div class="client-phone" id="c-phone"></div>
+        <div class="fields" id="c-fields"></div>
+        <div class="divider"></div>
+        <div class="actions">
+          <div class="row">
+            <select id="stage-select"></select>
+            <button onclick="changeStage()">Сменить стадию</button>
+          </div>
+          <textarea id="comment-text" placeholder="Комментарий к сделке…"></textarea>
+          <div class="row">
+            <button onclick="addComment()">Сохранить коммент</button>
+            <button class="ghost" onclick="addTask()">Поставить задачу</button>
+          </div>
+          <button class="open-bx" onclick="openBitrix()">Открыть в Bitrix</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB: LEADS -->
+    <div class="panel" id="panel-leads">
+      <div class="glass" id="leads-list"><div class="empty">Загрузка…</div></div>
+    </div>
+
+    <!-- TAB: PROFILE -->
+    <div class="panel" id="panel-profile">
+      <div class="glass prof-head">
+        <div class="avatar" id="prof-avatar"></div>
+        <div class="prof-name" id="prof-name"></div>
+        <div class="prof-sip" id="prof-sip"></div>
+      </div>
+      <div class="stat-grid" id="stat-grid"></div>
     </div>
   </div>
 
@@ -136,197 +255,154 @@
 <div class="toast" id="toast"></div>
 
 <script>
-let ME = null;
-let CURRENT_LEAD = null;
-let POLL = null;
-
-const STAGES = [
-  {id:"C12:NEW", name:"Тёплые лиды"},
-  {id:"C12:PREPARATION", name:"НДЗ"},
-  {id:"C12:UC_DGYTDZ", name:"НДЗ 2"},
-  {id:"C12:PREPAYMENT_INVOIC", name:"ПЕРЕЗВОНИТЬ"},
-  {id:"C12:EXECUTING", name:"ХОЛОД"},
-  {id:"C12:UC_CYJM1D", name:"Ссылка на рег"},
-  {id:"C12:UC_H47LCY", name:"Ссылка на регу НДЗ"},
-  {id:"C12:UC_0QXBHN", name:"КП"},
-  {id:"C12:UC_XCF40E", name:"Создан"},
-  {id:"C12:UC_LG27SJ", name:"Приглашен в хаб"},
-  {id:"C12:UC_GLR1Y1", name:"отправил промо"},
-  {id:"C12:FINAL_INVOICE", name:"Активирован"},
-  {id:"C12:WON", name:"Сделка успешна"},
-  {id:"C12:LOSE", name:"Сделка провалена"},
-  {id:"C12:APOLOGY", name:"Анализ причины провала"},
+let ME=null, CURRENT_LEAD=null, POLL=null, ACTIVE_TAB='call';
+const STAGES=[
+  {id:"C12:NEW",name:"Тёплые лиды"},{id:"C12:PREPARATION",name:"НДЗ"},
+  {id:"C12:UC_DGYTDZ",name:"НДЗ 2"},{id:"C12:PREPAYMENT_INVOIC",name:"ПЕРЕЗВОНИТЬ"},
+  {id:"C12:EXECUTING",name:"ХОЛОД"},{id:"C12:UC_CYJM1D",name:"Ссылка на рег"},
+  {id:"C12:UC_H47LCY",name:"Ссылка на регу НДЗ"},{id:"C12:UC_0QXBHN",name:"КП"},
+  {id:"C12:UC_XCF40E",name:"Создан"},{id:"C12:UC_LG27SJ",name:"Приглашен в хаб"},
+  {id:"C12:UC_GLR1Y1",name:"отправил промо"},{id:"C12:FINAL_INVOICE",name:"Активирован"},
+  {id:"C12:WON",name:"Сделка успешна"},{id:"C12:LOSE",name:"Сделка провалена"},
+  {id:"C12:APOLOGY",name:"Анализ причины провала"},
 ];
+function toggleTheme(){const h=document.documentElement;const n=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',n);document.getElementById('theme-btn').textContent=n==='dark'?'☾':'☀';}
+function toast(m,e){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(e?'err':'ok');setTimeout(()=>t.className='toast',2500);}
+function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
-function toast(msg, isErr) {
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.className = 'toast show' + (isErr ? ' err' : '');
-  setTimeout(() => t.className = 'toast', 2500);
+async function doLogin(){
+  const login=document.getElementById('login').value.trim();
+  const password=document.getElementById('password').value;
+  const err=document.getElementById('login-error'); err.textContent='';
+  try{
+    const r=await fetch('/manager/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login,password})});
+    if(!r.ok){err.textContent='Неверный логин или пароль';return;}
+    ME=await r.json(); showWork();
+  }catch(e){err.textContent='Ошибка соединения';}
 }
-
-async function doLogin() {
-  const login = document.getElementById('login').value.trim();
-  const password = document.getElementById('password').value;
-  const err = document.getElementById('login-error');
-  err.textContent = '';
-  try {
-    const r = await fetch('/manager/api/login', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({login, password})
-    });
-    if (!r.ok) { err.textContent = 'Неверный логин или пароль'; return; }
-    const data = await r.json();
-    ME = data;
-    showWork();
-  } catch(e) { err.textContent = 'Ошибка соединения'; }
-}
-
-async function doLogout() {
-  try { await fetch('/manager/api/logout', {method:'POST'}); } catch(e){}
-  if (POLL) clearInterval(POLL);
-  ME = null; CURRENT_LEAD = null;
+async function doLogout(){
+  try{await fetch('/manager/api/logout',{method:'POST'});}catch(e){}
+  if(POLL)clearInterval(POLL); ME=null;CURRENT_LEAD=null;
   document.getElementById('work-view').style.display='none';
   document.getElementById('login-view').style.display='block';
   document.getElementById('password').value='';
 }
-
-function showWork() {
+function showWork(){
   document.getElementById('login-view').style.display='none';
   document.getElementById('work-view').style.display='block';
-  document.getElementById('who').textContent = ME.name + ' · доб. ' + ME.sipnumber;
-  const dot = document.getElementById('status-dot');
-  const st = document.getElementById('status-text');
-  dot.className = 'status-dot ' + (ME.online ? 'online' : 'offline');
-  st.textContent = ME.online ? 'На линии' : 'Не на линии';
-  const sel = document.getElementById('stage-select');
-  sel.innerHTML = STAGES.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+  document.getElementById('who').textContent=ME.name+' · доб. '+ME.sipnumber;
+  const dot=document.getElementById('status-dot'),st=document.getElementById('status-text');
+  dot.className='status-dot '+(ME.online?'online':'offline');
+  st.textContent=ME.online?'На линии':'Не на линии';
+  document.getElementById('stage-select').innerHTML=STAGES.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
   startPolling();
 }
-
-function startPolling() {
-  if (POLL) clearInterval(POLL);
-  pollCall();
-  POLL = setInterval(pollCall, 2000);
+function switchTab(tab){
+  ACTIVE_TAB=tab;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel-'+tab).classList.add('active');
+  if(tab==='leads')loadLeads();
+  if(tab==='profile')loadProfile();
 }
-
-async function pollCall() {
-  try {
-    const r = await fetch('/manager/api/current-call');
-    if (r.status === 401) { doLogout(); return; }
-    const data = await r.json();
-    if (data && data.lead_id) {
-      showCall(data);
-    } else {
-      hideCall();
-    }
-  } catch(e) {}
+function startPolling(){ if(POLL)clearInterval(POLL); pollCall(); POLL=setInterval(pollCall,2000); }
+async function pollCall(){
+  try{
+    const r=await fetch('/manager/api/current-call');
+    if(r.status===401){doLogout();return;}
+    const data=await r.json();
+    if(data&&data.lead_id)showCall(data); else hideCall();
+  }catch(e){}
 }
-
-let LAST_LEAD = null;
-async function showCall(call) {
+let LAST_LEAD=null;
+async function showCall(call){
   document.getElementById('idle').style.display='none';
-  const card = document.getElementById('call-card');
-  card.style.display='block';
-  card.className = 'card ' + (call.connected ? 'connected' : 'ringing');
-  const badge = document.getElementById('call-badge');
-  badge.className = 'badge ' + (call.connected ? 'conn' : 'ring');
-  badge.textContent = call.connected ? '● Соединён' : '● Звонок…';
-
-  if (LAST_LEAD === call.lead_id) {
-    document.getElementById('c-phone').textContent = call.phone || '';
-    return;
-  }
-  LAST_LEAD = call.lead_id;
-  CURRENT_LEAD = call.lead_id;
-  document.getElementById('c-phone').textContent = call.phone || '';
-  document.getElementById('c-name').textContent = 'Загрузка…';
-  document.getElementById('c-fields').innerHTML = '';
-
-  try {
-    const r = await fetch('/manager/api/card/' + call.lead_id);
-    const c = await r.json();
-    document.getElementById('c-name').textContent = c.name || c.title || 'Клиент';
-    document.getElementById('c-phone').textContent = c.phone || call.phone || '';
-    const f = [];
-    if (c.title) f.push(['Сделка', c.title]);
-    if (c.amount) f.push(['Сумма', c.amount + ' ' + (c.currency||'')]);
-    if (c.source) f.push(['Источник', c.source]);
-    if (c.comments) f.push(['Заметки', c.comments]);
-    document.getElementById('c-fields').innerHTML =
-      f.map(([k,v]) => `<div class="k">${k}</div><div class="v">${escapeHtml(v)}</div>`).join('');
-    if (c.stage_id) document.getElementById('stage-select').value = c.stage_id;
-  } catch(e) {
-    document.getElementById('c-name').textContent = 'Клиент';
-  }
+  const card=document.getElementById('call-card'); card.style.display='block';
+  card.className='glass '+(call.connected?'connected':'ringing');
+  const badge=document.getElementById('call-badge');
+  badge.className='badge '+(call.connected?'conn':'ring');
+  badge.innerHTML='<span class="bd"></span>'+(call.connected?'Соединён':'Звонок…');
+  if(ACTIVE_TAB!=='call'&&!call.connected){} // карточка живёт во вкладке Звонок
+  if(LAST_LEAD===call.lead_id){document.getElementById('c-phone').textContent=call.phone||'';return;}
+  LAST_LEAD=call.lead_id; CURRENT_LEAD=call.lead_id;
+  document.getElementById('c-phone').textContent=call.phone||'';
+  document.getElementById('c-name').textContent='Загрузка…';
+  document.getElementById('c-fields').innerHTML='';
+  try{
+    const r=await fetch('/manager/api/card/'+call.lead_id); const c=await r.json();
+    document.getElementById('c-name').textContent=c.name||c.title||'Клиент';
+    document.getElementById('c-phone').textContent=c.phone||call.phone||'';
+    const f=[];
+    if(c.title)f.push(['Сделка',c.title]);
+    if(c.amount)f.push(['Сумма',c.amount+' '+(c.currency||'')]);
+    if(c.source)f.push(['Источник',c.source]);
+    if(c.comments)f.push(['Заметки',c.comments]);
+    document.getElementById('c-fields').innerHTML=f.map(([k,v])=>`<div class="k">${k}</div><div class="v">${escapeHtml(v)}</div>`).join('');
+    if(c.stage_id)document.getElementById('stage-select').value=c.stage_id;
+  }catch(e){document.getElementById('c-name').textContent='Клиент';}
 }
+function hideCall(){document.getElementById('call-card').style.display='none';document.getElementById('idle').style.display='block';LAST_LEAD=null;CURRENT_LEAD=null;}
 
-function hideCall() {
-  document.getElementById('call-card').style.display='none';
-  document.getElementById('idle').style.display='block';
-  LAST_LEAD = null; CURRENT_LEAD = null;
+async function loadLeads(){
+  const box=document.getElementById('leads-list');
+  box.innerHTML='<div class="empty">Загрузка…</div>';
+  try{
+    const r=await fetch('/manager/api/my-leads'); const list=await r.json();
+    if(!list.length){box.innerHTML='<div class="empty">Пока нет звонков</div>';return;}
+    box.innerHTML=list.map(l=>{
+      let cls='gray';
+      if(['connected','talk_finished'].includes(l.status))cls='green';
+      else if(l.status==='no_answer')cls='amber';
+      else if(['failed','max_attempts_reached'].includes(l.status))cls='red';
+      const tm=l.timestamp?new Date(l.timestamp).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'';
+      return `<div class="lead-item" onclick="openLead(${l.lead_id})">
+        <div class="lead-l"><div class="ph">${escapeHtml(l.phone||'')}</div><div class="nm">${escapeHtml(l.name||'Лид #'+l.lead_id)}</div></div>
+        <div class="lead-r"><span class="pill ${cls}">${escapeHtml(l.status_ru)}</span><div class="tm">${tm}</div></div>
+      </div>`;
+    }).join('');
+  }catch(e){box.innerHTML='<div class="empty">Ошибка загрузки</div>';}
 }
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-}
-
-async function changeStage() {
-  if (!CURRENT_LEAD) return;
-  const stage = document.getElementById('stage-select').value;
-  try {
-    const r = await fetch('/manager/api/action/stage', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({lead_id: CURRENT_LEAD, stage_id: stage})
-    });
-    toast(r.ok ? 'Стадия изменена' : 'Ошибка', !r.ok);
-  } catch(e) { toast('Ошибка соединения', true); }
-}
-
-async function addComment() {
-  if (!CURRENT_LEAD) return;
-  const text = document.getElementById('comment-text').value.trim();
-  if (!text) { toast('Введите комментарий', true); return; }
-  try {
-    const r = await fetch('/manager/api/action/comment', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({lead_id: CURRENT_LEAD, text})
-    });
-    if (r.ok) { document.getElementById('comment-text').value=''; toast('Комментарий сохранён'); }
-    else toast('Ошибка', true);
-  } catch(e) { toast('Ошибка соединения', true); }
-}
-
-async function addTask() {
-  if (!CURRENT_LEAD) return;
-  const text = document.getElementById('comment-text').value.trim() || 'Связаться с клиентом';
-  try {
-    const r = await fetch('/manager/api/action/task', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({lead_id: CURRENT_LEAD, title: text})
-    });
-    toast(r.ok ? 'Задача поставлена' : 'Ошибка', !r.ok);
-  } catch(e) { toast('Ошибка соединения', true); }
-}
-
-function openBitrix() {
-  if (!CURRENT_LEAD) return;
-  fetch('/manager/api/card/' + CURRENT_LEAD).then(r=>r.json()).then(c => {
-    if (c.bitrix_url) window.open(c.bitrix_url, '_blank');
-    else toast('Ссылка недоступна', true);
+function openLead(id){
+  fetch('/manager/api/card/'+id).then(r=>r.json()).then(c=>{
+    if(c.bitrix_url)window.open(c.bitrix_url,'_blank'); else toast('Ссылка недоступна',true);
   });
 }
+async function loadProfile(){
+  try{
+    const r=await fetch('/manager/api/my-stats'); const s=await r.json();
+    document.getElementById('prof-avatar').textContent=(s.name||'?').charAt(0);
+    document.getElementById('prof-name').textContent=s.name||'';
+    document.getElementById('prof-sip').textContent='Внутренний номер '+(s.sipnumber||'')+' · '+(s.online?'на линии':'не на линии');
+    document.getElementById('stat-grid').innerHTML=`
+      <div class="glass stat green"><div class="num">${s.connected||0}</div><div class="lbl">Соединено</div></div>
+      <div class="glass stat"><div class="num">${s.no_answer||0}</div><div class="lbl">Не ответили</div></div>
+      <div class="glass stat accent"><div class="num">${s.conversion||0}%</div><div class="lbl">Конверсия</div></div>
+      <div class="glass stat"><div class="num">${s.accepted_calls||0}</div><div class="lbl">Принято всего</div></div>`;
+  }catch(e){document.getElementById('stat-grid').innerHTML='<div class="empty">Ошибка загрузки</div>';}
+}
 
-// автологин если сессия жива
-(async function() {
-  try {
-    const r = await fetch('/manager/api/me');
-    if (r.ok) { ME = await r.json(); showWork(); }
-  } catch(e) {}
-})();
-
-document.getElementById('password').addEventListener('keydown', e => {
-  if (e.key === 'Enter') doLogin();
-});
+async function changeStage(){
+  if(!CURRENT_LEAD)return;
+  const stage=document.getElementById('stage-select').value;
+  try{const r=await fetch('/manager/api/action/stage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_id:CURRENT_LEAD,stage_id:stage})});toast(r.ok?'Стадия изменена':'Ошибка',!r.ok);}catch(e){toast('Ошибка соединения',true);}
+}
+async function addComment(){
+  if(!CURRENT_LEAD)return;
+  const text=document.getElementById('comment-text').value.trim();
+  if(!text){toast('Введите комментарий',true);return;}
+  try{const r=await fetch('/manager/api/action/comment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_id:CURRENT_LEAD,text})});if(r.ok){document.getElementById('comment-text').value='';toast('Комментарий сохранён');}else toast('Ошибка',true);}catch(e){toast('Ошибка соединения',true);}
+}
+async function addTask(){
+  if(!CURRENT_LEAD)return;
+  const text=document.getElementById('comment-text').value.trim()||'Связаться с клиентом';
+  try{const r=await fetch('/manager/api/action/task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_id:CURRENT_LEAD,title:text})});toast(r.ok?'Задача поставлена':'Ошибка',!r.ok);}catch(e){toast('Ошибка соединения',true);}
+}
+function openBitrix(){
+  if(!CURRENT_LEAD)return;
+  fetch('/manager/api/card/'+CURRENT_LEAD).then(r=>r.json()).then(c=>{if(c.bitrix_url)window.open(c.bitrix_url,'_blank');else toast('Ссылка недоступна',true);});
+}
+(async function(){try{const r=await fetch('/manager/api/me');if(r.ok){ME=await r.json();showWork();}}catch(e){}})();
+document.getElementById('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
 </script>
 </body>
 </html>

@@ -12,7 +12,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from .config import settings
 from .db import async_session_maker
@@ -124,4 +124,79 @@ async def get_current_call(manager_id: int) -> Optional[dict]:
             "state": s.state,
             "started_at": s.started_at.isoformat() + "Z" if s.started_at else None,
             "connected": s.state == "CONNECTED",
+        }
+
+
+# ── Мои лиды (история) ───────────────────────────────────────
+_STATUS_RU = {
+    "callback_created": "Звонок создан",
+    "connected": "Соединён",
+    "talk_finished": "Разговор завершён",
+    "no_answer": "Не ответил",
+    "no_managers": "Нет на линии",
+    "scheduled": "В очереди",
+    "max_attempts_reached": "Исчерпаны попытки",
+    "failed": "Ошибка",
+    "duplicate_phone": "Дубль номера",
+}
+
+
+async def get_my_leads(manager_id: int, limit: int = 40) -> list:
+    """История лидов этого менеджера из call_logs (последние N)."""
+    from .models import CallLog
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(CallLog)
+            .where(CallLog.manager_id == manager_id)
+            .order_by(CallLog.timestamp.desc())
+            .limit(limit)
+        )
+        rows = result.scalars().all()
+        out = []
+        for r in rows:
+            out.append({
+                "lead_id": r.lead_id,
+                "phone": r.phone,
+                "name": r.lead_name,
+                "type": r.type,
+                "status": r.status,
+                "status_ru": _STATUS_RU.get(r.status, r.status),
+                "talk_seconds": r.talk_seconds,
+                "timestamp": (r.timestamp.isoformat() + "Z") if r.timestamp else None,
+            })
+        return out
+
+
+async def get_my_stats(manager_id: int) -> dict:
+    """Личная статистика менеджера для раздела «Профиль»."""
+    from .models import CallLog
+    async with async_session_maker() as session:
+        mgr = await session.get(Manager, manager_id)
+        if not mgr:
+            return {}
+        # считаем из call_logs: соединения и недозвоны этого менеджера
+        connected = await session.execute(
+            select(func.count()).select_from(CallLog)
+            .where(CallLog.manager_id == manager_id)
+            .where(CallLog.status.in_(["connected", "talk_finished"]))
+        )
+        no_answer = await session.execute(
+            select(func.count()).select_from(CallLog)
+            .where(CallLog.manager_id == manager_id)
+            .where(CallLog.status == "no_answer")
+        )
+        c = connected.scalar() or 0
+        na = no_answer.scalar() or 0
+        total = c + na
+        conv = round(100 * c / total) if total else 0
+        return {
+            "name": mgr.name,
+            "sipnumber": mgr.sipnumber,
+            "online": bool(mgr.online),
+            "accepted_calls": int(mgr.accepted_calls or 0),
+            "missed": int(mgr.missed or 0),
+            "connected": c,
+            "no_answer": na,
+            "conversion": conv,
+            "priority_score": round(float(mgr.priority_score or 0.5), 2),
         }

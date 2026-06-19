@@ -863,6 +863,22 @@ async def portal_card(lead_id: int,
     return await get_deal_card(lead_id)
 
 
+@app.get("/manager/api/my-leads", include_in_schema=False)
+async def portal_my_leads(mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    return await portal.get_my_leads(mgr.id)
+
+
+@app.get("/manager/api/my-stats", include_in_schema=False)
+async def portal_my_stats(mgr_session: Optional[str] = Cookie(default=None)):
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    return await portal.get_my_stats(mgr.id)
+
+
 class PortalStage(BaseModel):
     lead_id: int
     stage_id: str
