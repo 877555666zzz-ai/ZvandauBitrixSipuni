@@ -131,9 +131,11 @@ def parse_sipuni_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
         "external", "to", "number", "dst",
     ])
 
-    # Событие: 1 = начат, 2 = завершён (финальное)
+    # Событие: 1 = начат, 2 = завершён (финальное), 3 = соединение плеч
+    # (оператор реально взял трубку — приходит РАНЬШЕ финала).
     event_raw = _first(["event"])
     event_finished = str(event_raw) == "2"
+    event_connected = str(event_raw) == "3"
 
     # Длительность разговора: timestamp(финал) - call_start_timestamp
     talk_seconds: Optional[float] = None
@@ -166,6 +168,7 @@ def parse_sipuni_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
         "talk_seconds": talk_seconds,
         "answered": bool(answered),
         "event_finished": event_finished,
+        "event_connected": event_connected,
         "raw": body,
     }
 

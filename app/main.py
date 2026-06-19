@@ -29,6 +29,7 @@ from sqlalchemy import desc, func, select
 from .bitrix_client import (
     add_deal_comment,
     add_deal_task,
+    assign_deal_responsible,
     extract_deal_meta,
     extract_lead_meta,
     extract_phone,
@@ -48,6 +49,7 @@ from .dispatcher import (
     autodial_worker,
     handle_sipuni_status,
     mark_busy_from_sipuni,
+    normalize_phone,
     process_new_lead,
 )
 from .models import AutodialQueue, CallLog, CallSession, Manager
@@ -692,6 +694,34 @@ async def sipuni_status_webhook(
         sipnumber=parsed.get("sipnumber"),
         event_finished=bool(parsed.get("event_finished")),
     )
+
+    # event=3 — оператор реально взял трубку (соединение плеч). Приходит
+    # РАНЬШЕ финала. Назначаем ответственного сразу, чтобы оператор мог
+    # открыть карточку прямо во время разговора, не дожидаясь конца.
+    if parsed.get("event_connected"):
+        sip = parsed.get("sipnumber")
+        phone = parsed.get("client_phone")
+        if sip and phone:
+            try:
+                async with async_session_maker() as session:
+                    norm = normalize_phone(phone)
+                    result = await session.execute(
+                        select(CallSession).where(
+                            CallSession.manager_sipnumber == str(sip),
+                            CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]),
+                        ).order_by(CallSession.started_at.desc())
+                    )
+                    for s in result.scalars().all():
+                        if normalize_phone(s.phone) == norm:
+                            await assign_deal_responsible(s.lead_id, str(sip))
+                            logger.info(
+                                "[sipuni-webhook] лид %d: оператор взял трубку → "
+                                "назначен ответственным (sip=%s)", s.lead_id, sip,
+                            )
+                            break
+            except Exception as e:
+                logger.warning("[sipuni-webhook] event=3 assign failed: %s", e)
+        return {"ok": True, "event": "connected"}
 
     # Sipuni шлёт event=1 (звонок начат) и event=2 (завершён).
     # Реагируем только на финальное событие, начало просто подтверждаем.
