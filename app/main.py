@@ -583,6 +583,26 @@ async def clear_autodial_queue(_: None = Depends(require_auth)):
     return {"ok": True, "removed_from_queue": int(cnt), "closed_sessions": closed}
 
 
+@app.post("/autodial/retry-now/{lead_id}")
+async def retry_now(lead_id: int, _: None = Depends(require_auth)):
+    """«Дозвониться сейчас» — выдернуть лид из таймерного перезвона в очередь
+    ОЖИДАНИЯ немедленно: ставим next_call_time=now и state=WAITING, чтобы воркер
+    взял его на ближайшей итерации (≈15с), не дожидаясь +5/15/30 минут.
+    """
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(AutodialQueue).where(AutodialQueue.lead_id == lead_id)
+        )
+        item = result.scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail="lead_not_in_queue")
+        item.state = "WAITING"
+        item.next_call_time = datetime.utcnow()
+        await session.commit()
+    logger.info("[retry-now] лид %d → очередь ожидания (немедленно)", lead_id)
+    return {"ok": True, "lead_id": lead_id, "state": "WAITING"}
+
+
 @app.get("/live/active-calls")
 async def live_active_calls(_: None = Depends(require_auth)):
     """Кто сейчас на звонке. Берём свежие сессии в работе (CALLBACK_CREATED —
@@ -991,6 +1011,13 @@ async def sipuni_status_webhook(
                     )
                     for s in result.scalars().all():
                         if normalize_phone(s.phone) == norm:
+                            # Помечаем, что менеджер реально взял трубку — это
+                            # сигнал для handle_sipuni_status: если потом клиент
+                            # не ответит, это недозвон ДО КЛИЕНТА (таймерный
+                            # перезвон), а не «менеджер не взял» (очередь ожидания).
+                            if s.connected_at is None:
+                                s.connected_at = datetime.utcnow()
+                                await session.commit()
                             await assign_deal_responsible(s.lead_id, str(sip))
                             logger.info(
                                 "[sipuni-webhook] лид %d: оператор взял трубку → "

@@ -718,23 +718,27 @@ async def process_new_lead(
             message="Никто не принял callback",
         )
 
-        if not is_autodial:
-            await schedule_autodial(
-                lead_id, client_phone, current_attempts=0,
-                lead_name=lead_name, lead_source=lead_source,
-            )
-            await update_lead_status(lead_id, "retry")
-            await add_lead_comment(
-                lead_id,
-                "Автодозвон: никто не ответил — в очереди повторного дозвона.",
-            )
-        else:
-            await update_lead_status(lead_id, "retry")
+        # Sipuni не принял callback ни к одному менеджеру (линия занята/недоступна).
+        # КЛИЕНТА ещё НЕ набирали — звоним сначала менеджеру. Значит это проблема
+        # доступности менеджера, а не клиента → в очередь ОЖИДАНИЯ (быстрый повтор
+        # при освобождении оператора), НЕ в таймерный перезвон.
+        await _enqueue_waiting(
+            lead_id, client_phone,
+            attempts=0,
+            lead_name=lead_name, lead_source=lead_source,
+            insert_if_missing=not from_queue,
+        )
+        await update_lead_status(lead_id, "retry")
 
-        logger.info("[dispatch] лид %d: никто, попыток=%d", lead_id, len(attempts))
+        logger.info(
+            "[dispatch] лид %d: callback не принят менеджером(ами) → очередь ожидания "
+            "(попыток callback=%d)", lead_id, len(attempts),
+        )
         return {
+            # Тот же статус, что и при отсутствии свободного менеджера — воркер
+            # тогда НЕ переводит лид в таймерный перезвон, а оставляет ждать.
             "ok": True,
-            "status": "no_manager_answered",
+            "status": "no_managers_available",
             "lead_id": lead_id,
             "attempts": attempts,
         }
@@ -883,27 +887,49 @@ async def handle_sipuni_status(
             )
             return {"ok": True, "matched": True, "state": "NO_ANSWER_CASCADED"}
 
-        # Свободных операторов больше нет — лид в очередь на повтор по таймеру.
+        # Свободных операторов больше нет. Различаем причину недозвона:
+        #
+        #  • Менеджер ТАК И НЕ ВЗЯЛ ТРУБКУ (нет event=3 → connected_at пуст).
+        #    Клиента при этом вообще НЕ набирали (звоним сначала менеджеру).
+        #    Это проблема доступности менеджера → в очередь ОЖИДАНИЯ, дозвонимся
+        #    как только освободится оператор (НЕ таймерный перезвон).
+        #
+        #  • Менеджер ОТВЕТИЛ (event=3 был → connected_at заполнен), а клиент
+        #    не ответил → реальный недозвон ДО КЛИЕНТА → таймерный перезвон
+        #    (+5/15/30) и стадия НДЗ.
+        manager_answered = s.connected_at is not None
+
+        if manager_answered:
+            logger.info(
+                "[sipuni-webhook] лид %d: менеджер ответил, клиент не ответил → "
+                "таймерный перезвон", s.lead_id,
+            )
+            await schedule_autodial(
+                s.lead_id, s.phone, current_attempts=s.attempts_used,
+            )
+            await update_lead_status(s.lead_id, "retry")
+            await update_deal_stage(s.lead_id, settings.BITRIX_STAGE_NDZ)
+            await add_lead_comment(
+                s.lead_id,
+                "Клиент не ответил — лид поставлен в автодозвон на повтор.",
+            )
+            return {"ok": True, "matched": True, "state": "NO_ANSWER"}
+
+        # Менеджер не взял трубку — клиента не набирали → очередь ожидания.
         logger.info(
-            "[sipuni-webhook] лид %d: все операторы не ответили/заняты → в очередь",
-            s.lead_id,
+            "[sipuni-webhook] лид %d: оператор не взял трубку, свободных нет → "
+            "очередь ожидания", s.lead_id,
         )
-        await schedule_autodial(
-            s.lead_id, s.phone, current_attempts=s.attempts_used,
+        await _enqueue_waiting(
+            s.lead_id, s.phone, attempts=s.attempts_used,
         )
         await update_lead_status(s.lead_id, "retry")
-        # Клиент не ответил, но попытки ещё есть → стадия НДЗ
-        await update_deal_stage(s.lead_id, settings.BITRIX_STAGE_NDZ)
         await add_lead_comment(
             s.lead_id,
-            f"Все операторы не ответили/заняты. Лид поставлен в автодозвон "
-            f"на повтор.",
+            "Операторы заняты/не ответили — лид в очереди ожидания, позвоним "
+            "как только освободится оператор.",
         )
-        logger.info(
-            "[sipuni-webhook] лид %d NO_ANSWER, менеджер=%s",
-            s.lead_id, s.manager_name,
-        )
-        return {"ok": True, "matched": True, "state": "NO_ANSWER"}
+        return {"ok": True, "matched": True, "state": "WAITING"}
 
 
 # ─────────────────────────────────────────────
