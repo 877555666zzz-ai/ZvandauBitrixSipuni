@@ -896,11 +896,23 @@ async def handle_sipuni_status(
 # ─────────────────────────────────────────────
 # Worker
 # ─────────────────────────────────────────────
+# Heartbeat: воркер обновляет эту метку в начале каждой итерации цикла.
+# Дашборд по ней понимает, жив ли воркер (если метка свежая — жив).
+_worker_last_tick: Optional[datetime] = None
+
+
+def worker_last_tick() -> Optional[datetime]:
+    """Когда воркер последний раз «тикнул» (UTC). None — ещё не запускался."""
+    return _worker_last_tick
+
+
 async def autodial_worker() -> None:
+    global _worker_last_tick
     interval = settings.AUTODIAL_POLL_INTERVAL_SECONDS
     logger.info("[autodial_worker] запущен, интервал=%ds", interval)
 
     while True:
+        _worker_last_tick = datetime.utcnow()
         try:
             # Вне рабочего окна 11:00–21:00 (Алматы) очередь не обзваниваем —
             # отложенные лиды дождутся открытия. Гарантия: ночью клиентам

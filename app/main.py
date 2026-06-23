@@ -24,10 +24,11 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import delete, desc, func, select
 
 from .bitrix_client import (
     add_deal_comment,
+    add_lead_comment,
     add_deal_task,
     assign_deal_responsible,
     extract_deal_meta,
@@ -51,6 +52,7 @@ from .dispatcher import (
     mark_busy_from_sipuni,
     normalize_phone,
     process_new_lead,
+    worker_last_tick,
 )
 from .models import AutodialQueue, CallLog, CallSession, Manager
 from . import manager_portal as portal
@@ -395,6 +397,16 @@ async def get_analytics(
             select(func.count()).select_from(AutodialQueue)
         )).scalar_one()
 
+        waiting_now = (await session.execute(
+            select(func.count()).select_from(AutodialQueue)
+            .where(AutodialQueue.state == "WAITING")
+        )).scalar_one()
+
+        retry_now = (await session.execute(
+            select(func.count()).select_from(AutodialQueue)
+            .where(AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS"]))
+        )).scalar_one()
+
     total = len(logs)
     connected = sum(1 for l in logs if l.status in ("connected", "callback_created"))
     real_connected = sum(1 for l in logs if l.status == "connected")
@@ -421,6 +433,25 @@ async def get_analytics(
     else:
         avg_reaction = median_reaction = p90_reaction = pct_under_60 = 0
 
+    # Нагрузка по часам (локальное время Алматы, UTC+5): сколько лидов
+    # приходило в каждый час суток — видно пики для планирования смен.
+    hourly = [0] * 24
+    for l in logs:
+        if l.type in ("initial", "autodial") and l.timestamp:
+            local_hour = (l.timestamp + timedelta(hours=5)).hour
+            hourly[local_hour] += 1
+
+    # Конверсия по каждому менеджеру: connected vs no_answer из логов.
+    per_mgr: dict = {}
+    for l in logs:
+        if l.manager_id is None:
+            continue
+        d = per_mgr.setdefault(l.manager_id, {"connected": 0, "no_answer": 0})
+        if l.status == "connected":
+            d["connected"] += 1
+        elif l.status == "no_answer":
+            d["no_answer"] += 1
+
     return {
         "period_days": days,
         "total_calls": total,
@@ -433,6 +464,9 @@ async def get_analytics(
         "autodial_calls": autodial_calls,
         "conversion_rate": conversion_rate,
         "total_ever_queued": total_queued,
+        "waiting_now": waiting_now,
+        "retry_now": retry_now,
+        "hourly_load": hourly,
         "reaction_time": {
             "avg_seconds": avg_reaction,
             "median_seconds": median_reaction,
@@ -448,10 +482,222 @@ async def get_analytics(
                 "accepted_calls": int(m.accepted_calls or 0),
                 "missed": int(m.missed or 0),
                 "priority_score": round(float(m.priority_score or 0.5), 3),
+                "connected": per_mgr.get(m.id, {}).get("connected", 0),
+                "no_answer": per_mgr.get(m.id, {}).get("no_answer", 0),
+                "conversion": (
+                    round(
+                        100 * per_mgr[m.id]["connected"]
+                        / (per_mgr[m.id]["connected"] + per_mgr[m.id]["no_answer"])
+                    )
+                    if m.id in per_mgr
+                    and (per_mgr[m.id]["connected"] + per_mgr[m.id]["no_answer"]) > 0
+                    else 0
+                ),
             }
             for m in managers
         ],
     }
+
+
+# ─── Dashboard extras (Заход 1) ─────────────────────────────
+@app.post("/autodial/cancel/{lead_id}")
+async def cancel_autodial(lead_id: int, _: None = Depends(require_auth)):
+    """Отменить/дропнуть лид: убрать из очереди (любое состояние) + закрыть
+    активную сессию + написать комментарий в Bitrix. Стадию сделки НЕ трогаем.
+    Нужно, например, когда в воронку случайно попал холодный лид.
+    """
+    removed_queue = 0
+    closed_sessions = 0
+    async with async_session_maker() as session:
+        # убрать из очереди — в любом состоянии (WAITING/SCHEDULED/IN_PROGRESS)
+        q = await session.execute(
+            select(AutodialQueue).where(AutodialQueue.lead_id == lead_id)
+        )
+        for row in q.scalars().all():
+            await session.delete(row)
+            removed_queue += 1
+        # закрыть незавершённые сессии этого лида, чтобы будущий Sipuni webhook
+        # их не подхватил (переводим в ERROR — он нигде не матчится)
+        s = await session.execute(
+            select(CallSession).where(
+                CallSession.lead_id == lead_id,
+                CallSession.state.in_(["PENDING", "CALLBACK_CREATED"]),
+            )
+        )
+        for sess in s.scalars().all():
+            sess.state = "ERROR"
+            closed_sessions += 1
+        await session.commit()
+
+    # Комментарий в Bitrix (и в лид, и в сделку) — не валим запрос если не вышло
+    try:
+        await add_deal_comment(lead_id, "Автодозвон отменён вручную из дашборда.")
+    except Exception:
+        pass
+    try:
+        await add_lead_comment(lead_id, "Автодозвон отменён вручную из дашборда.")
+    except Exception:
+        pass
+
+    logger.info(
+        "[cancel] лид %d: убрано из очереди=%d, закрыто сессий=%d",
+        lead_id, removed_queue, closed_sessions,
+    )
+    return {
+        "ok": True,
+        "lead_id": lead_id,
+        "removed_from_queue": removed_queue,
+        "closed_sessions": closed_sessions,
+    }
+
+
+@app.get("/live/active-calls")
+async def live_active_calls(_: None = Depends(require_auth)):
+    """Кто сейчас на звонке. Берём свежие сессии в работе (CALLBACK_CREATED —
+    система дозвонилась оператору, идёт звонок). Длительность — от момента
+    callback. Старше 5 минут не показываем (значит звонок давно завершился).
+    """
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=5)
+    async with async_session_maker() as session:
+        rows = (await session.execute(
+            select(CallSession)
+            .where(CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]))
+            .where(CallSession.started_at >= cutoff)
+            .order_by(CallSession.started_at.desc())
+        )).scalars().all()
+    out = []
+    for s in rows:
+        base = s.callback_at or s.connected_at or s.started_at
+        dur = int((now - base).total_seconds()) if base else None
+        out.append({
+            "lead_id": s.lead_id,
+            "phone": s.phone,
+            "manager_id": s.manager_id,
+            "manager_name": s.manager_name,
+            "state": s.state,
+            "connected": s.state == "CONNECTED",
+            "duration_seconds": dur,
+        })
+    return {"count": len(out), "active": out}
+
+
+@app.post("/managers/online-all")
+async def all_managers_online(_: None = Depends(require_auth)):
+    """Поставить всех менеджеров на линию (начало смены — одним кликом)."""
+    async with async_session_maker() as session:
+        rows = (await session.execute(select(Manager))).scalars().all()
+        changed = 0
+        for m in rows:
+            if not m.online:
+                changed += 1
+            m.online = True
+            m.missed = 0
+        await session.commit()
+    logger.info("[bulk] все на линии (изменено %d из %d)", changed, len(rows))
+    return {"ok": True, "set_online": changed, "total": len(rows)}
+
+
+@app.post("/managers/offline-all")
+async def all_managers_offline(_: None = Depends(require_auth)):
+    """Снять всех менеджеров с линии (конец смены — одним кликом)."""
+    async with async_session_maker() as session:
+        rows = (await session.execute(select(Manager))).scalars().all()
+        changed = 0
+        for m in rows:
+            if m.online:
+                changed += 1
+            m.online = False
+        await session.commit()
+    logger.info("[bulk] все сняты с линии (изменено %d из %d)", changed, len(rows))
+    return {"ok": True, "set_offline": changed, "total": len(rows)}
+
+
+@app.get("/system/status")
+async def system_status(_: None = Depends(require_auth)):
+    """Индикатор «система жива»: жив ли воркер (по heartbeat), когда был
+    последний лид, сколько ждут/в перезвоне, сколько на линии.
+    """
+    now = datetime.utcnow()
+    tick = worker_last_tick()
+    interval = settings.AUTODIAL_POLL_INTERVAL_SECONDS
+    # Воркер считаем живым, если тикал не позже 3 интервалов назад.
+    worker_alive = bool(tick and (now - tick).total_seconds() < interval * 3 + 10)
+
+    async with async_session_maker() as session:
+        last_lead = (await session.execute(
+            select(CallLog)
+            .where(CallLog.type.in_(["initial", "autodial"]))
+            .order_by(desc(CallLog.timestamp)).limit(1)
+        )).scalars().first()
+        online_cnt = (await session.execute(
+            select(func.count()).select_from(Manager).where(Manager.online.is_(True))
+        )).scalar_one()
+        waiting_cnt = (await session.execute(
+            select(func.count()).select_from(AutodialQueue)
+            .where(AutodialQueue.state == "WAITING")
+        )).scalar_one()
+        retry_cnt = (await session.execute(
+            select(func.count()).select_from(AutodialQueue)
+            .where(AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS"]))
+        )).scalar_one()
+
+    last_ts = last_lead.timestamp if last_lead else None
+    return {
+        "server_time": now.isoformat() + "Z",
+        "worker_alive": worker_alive,
+        "worker_last_tick": (tick.isoformat() + "Z") if tick else None,
+        "worker_interval_seconds": interval,
+        "last_lead_at": (last_ts.isoformat() + "Z") if last_ts else None,
+        "seconds_since_last_lead": (
+            int((now - last_ts).total_seconds()) if last_ts else None
+        ),
+        "managers_online": online_cnt,
+        "waiting": waiting_cnt,
+        "retry_scheduled": retry_cnt,
+    }
+
+
+@app.get("/logs/export.csv")
+async def export_logs_csv(
+    days: int = Query(30, ge=1, le=365), _: None = Depends(require_auth)
+):
+    """Экспорт журнала звонков в CSV за период (для отчётности)."""
+    import csv
+    import io
+
+    since = datetime.utcnow() - timedelta(days=days)
+    async with async_session_maker() as session:
+        logs = (await session.execute(
+            select(CallLog)
+            .where(CallLog.timestamp >= since)
+            .order_by(desc(CallLog.timestamp))
+        )).scalars().all()
+
+    buf = io.StringIO()
+    buf.write("\ufeff")  # BOM — чтобы Excel корректно открыл кириллицу
+    w = csv.writer(buf)
+    w.writerow([
+        "timestamp_utc", "lead_id", "phone", "lead_name", "type", "status",
+        "manager_name", "reaction_seconds", "talk_seconds", "message",
+    ])
+    for l in logs:
+        w.writerow([
+            (l.timestamp.isoformat() + "Z") if l.timestamp else "",
+            l.lead_id, l.phone, l.lead_name or "", l.type, l.status,
+            l.manager_name or "",
+            l.reaction_seconds if l.reaction_seconds is not None else "",
+            l.talk_seconds if l.talk_seconds is not None else "",
+            (l.message or "").replace("\n", " ").replace("\r", " "),
+        ])
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="autocall_logs_{days}d.csv"'
+        },
+    )
 
 
 # ─── Bitrix webhook ─────────────────────────────────────────
