@@ -36,7 +36,10 @@ class Settings(BaseSettings):
     MANAGER_ANSWER_TIMEOUT_SECONDS: int = 30
     MAX_MANAGER_MISSED: int = 3
     MAX_AUTODIAL_ATTEMPTS: int = 6
-    AUTODIAL_POLL_INTERVAL_SECONDS: int = 30
+    # Интервал воркера: как часто проверяем очередь. Уменьшен до 15с, чтобы
+    # лиды из очереди ОЖИДАНИЯ быстро уходили освободившемуся менеджеру
+    # (переключение на следующий звонок за ~15с, без простоя).
+    AUTODIAL_POLL_INTERVAL_SECONDS: int = 15
     BITRIX_TIMEOUT_SECONDS: float = 8.0
     SIPUNI_TIMEOUT_SECONDS: float = 10.0
 

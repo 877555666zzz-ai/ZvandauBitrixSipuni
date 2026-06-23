@@ -337,7 +337,7 @@ async def get_logs(
 
         queue = (await session.execute(
             select(AutodialQueue)
-            .where(AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS"]))
+            .where(AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS", "WAITING"]))
             .order_by(AutodialQueue.next_call_time)
         )).scalars().all()
 

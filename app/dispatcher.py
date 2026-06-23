@@ -396,6 +396,62 @@ async def schedule_autodial(
 
 
 # ─────────────────────────────────────────────
+# Очередь ОЖИДАНИЯ свободного менеджера (быстрая полоса)
+# ─────────────────────────────────────────────
+# Отличие от schedule_autodial (перезвон по таймеру):
+#   WAITING   — лид готов прямо сейчас, ждёт лишь когда освободится менеджер.
+#               next_call_time = now, номер попытки НЕ растёт (это не провал
+#               дозвона, а просто ожидание свободного оператора). Воркер
+#               проверяет такие лиды часто и отдаёт первому же освободившемуся
+#               менеджеру (FIFO — кто раньше встал в очередь, того и первым).
+#   SCHEDULED — перезвон через +5/+15/+30 мин (до клиента не дозвонились).
+#
+# Возвращает True, если лид ТОЛЬКО ЧТО поставлен в ожидание (его раньше не было
+# в очереди в состоянии WAITING). False — если он уже ждал (это повторная
+# проверка воркером). Нужно, чтобы не спамить Bitrix-комментарием/алертом на
+# каждой итерации ожидания.
+async def _enqueue_waiting(
+    lead_id: int,
+    phone: str,
+    attempts: int = 0,
+    lead_name: Optional[str] = None,
+    lead_source: Optional[str] = None,
+) -> bool:
+    now = datetime.utcnow()
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(AutodialQueue).where(AutodialQueue.lead_id == lead_id)
+        )
+        item = result.scalar_one_or_none()
+        was_waiting = bool(item and item.state == "WAITING")
+        if item:
+            item.phone = phone
+            item.lead_name = lead_name or item.lead_name
+            item.lead_source = lead_source or item.lead_source
+            item.next_call_time = now          # готов сразу
+            item.state = "WAITING"
+            # attempts НЕ трогаем — ожидание не списывает попытку дозвона
+        else:
+            session.add(
+                AutodialQueue(
+                    lead_id=lead_id,
+                    phone=phone,
+                    lead_name=lead_name,
+                    lead_source=lead_source,
+                    attempts=attempts,
+                    next_call_time=now,
+                    state="WAITING",
+                )
+            )
+        try:
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.warning("[waiting] enqueue conflict #%d: %s", lead_id, e)
+    return not was_waiting
+
+
+# ─────────────────────────────────────────────
 # Основная логика
 # ─────────────────────────────────────────────
 async def _phone_recently_handled(phone: str, exclude_lead_id: int) -> bool:
@@ -427,10 +483,10 @@ async def _phone_recently_handled(phone: str, exclude_lead_id: int) -> bool:
         for ph, _lid in active.all():
             if normalize_phone(ph) == norm:
                 return True
-        # 2) номер уже в очереди автодозвона (ждёт повтора)
+        # 2) номер уже в очереди автодозвона (ждёт повтора или свободного менеджера)
         queued = await session.execute(
             select(AutodialQueue.phone, AutodialQueue.lead_id).where(
-                AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS"]),
+                AutodialQueue.state.in_(["SCHEDULED", "IN_PROGRESS", "WAITING"]),
                 AutodialQueue.lead_id != exclude_lead_id,
             )
         )
@@ -504,28 +560,50 @@ async def process_new_lead(
         call_type = "autodial" if is_autodial else "initial"
 
         if not managers:
-            logger.warning("[dispatch] лид %d: нет online менеджеров", lead_id)
-            reaction = (datetime.utcnow() - received_at).total_seconds()
-            await _log_call(
-                lead_id=lead_id, phone=client_phone, call_type=call_type,
-                status="no_managers", attempts=[],
+            # Нет СВОБОДНОГО менеджера (все заняты или оффлайн). РАНЬШЕ лид
+            # улетал в таймерный перезвон (+5 мин) и простаивал, пока
+            # единственный оператор был на звонке. ТЕПЕРЬ лид встаёт в очередь
+            # ОЖИДАНИЯ (WAITING) и будет отдан первому же менеджеру, который
+            # освободится — воркер проверяет очередь часто. Так теплые лиды не
+            # простаивают, а операторы всегда заняты.
+            #
+            # Важно: клиенту в этой ветке мы ещё НЕ звонили (в callback-схеме
+            # клиент набирается только после ответа менеджера), поэтому держать
+            # лид в ожидании и быстро перезапускать дозвон безопасно — клиента
+            # это не дёргает.
+            first_time = await _enqueue_waiting(
+                lead_id, client_phone,
+                attempts=0,
                 lead_name=lead_name, lead_source=lead_source,
-                reaction_seconds=reaction,
-                message="Нет online менеджеров",
             )
-            await send_alert(
-                f"🟡 Лид #{lead_id} ({lead_name or 'без имени'}, {client_phone}): "
-                f"нет менеджеров на линии"
-            )
-            if not is_autodial:
-                await schedule_autodial(
-                    lead_id, client_phone, current_attempts=0,
+            if first_time:
+                logger.warning(
+                    "[dispatch] лид %d: нет свободных менеджеров → очередь ожидания",
+                    lead_id,
+                )
+                reaction = (datetime.utcnow() - received_at).total_seconds()
+                await _log_call(
+                    lead_id=lead_id, phone=client_phone, call_type=call_type,
+                    status="no_managers", attempts=[],
                     lead_name=lead_name, lead_source=lead_source,
+                    reaction_seconds=reaction,
+                    message="Нет свободных менеджеров — лид в очереди ожидания",
                 )
                 await update_lead_status(lead_id, "retry")
                 await add_lead_comment(
                     lead_id,
-                    "Автодозвон: нет менеджеров на линии — лид в очереди.",
+                    "Все менеджеры сейчас заняты — лид в очереди ожидания, "
+                    "позвоним как только освободится оператор.",
+                )
+                await send_alert(
+                    f"🟡 Лид #{lead_id} ({lead_name or 'без имени'}, {client_phone}): "
+                    f"все менеджеры заняты — лид в очереди ожидания"
+                )
+            else:
+                # Повторная проверка воркером — лид уже ждёт, не спамим.
+                logger.info(
+                    "[dispatch] лид %d: всё ещё нет свободных — ждёт в очереди",
+                    lead_id,
                 )
             return {"ok": True, "status": "no_managers_available", "lead_id": lead_id}
 
@@ -835,8 +913,16 @@ async def autodial_worker() -> None:
             async with async_session_maker() as session:
                 result = await session.execute(
                     select(AutodialQueue).where(
-                        AutodialQueue.state == "SCHEDULED",
+                        # WAITING — ждут свободного менеджера (next_call_time=now,
+                        #           т.е. всегда «готовы»); SCHEDULED — перезвон по
+                        #           таймеру, когда пришло время.
+                        AutodialQueue.state.in_(["WAITING", "SCHEDULED"]),
                         AutodialQueue.next_call_time <= now,
+                    ).order_by(
+                        # FIFO: сперва у кого время раньше, затем по порядку
+                        # постановки в очередь (id). Так первый вставший лид
+                        # уходит первому освободившемуся менеджеру.
+                        AutodialQueue.next_call_time, AutodialQueue.id
                     )
                 )
                 items = list(result.scalars().all())
@@ -862,7 +948,22 @@ async def autodial_worker() -> None:
                         lead_source=lead_source,
                         is_autodial=True,
                     )
-                    if res.get("status") != "callback_created":
+                    status = res.get("status")
+                    if status == "callback_created":
+                        # Дозвонились до менеджера — process_new_lead уже убрал
+                        # лид из очереди. Ничего не делаем.
+                        pass
+                    elif status == "no_managers_available":
+                        # Свободного менеджера нет — process_new_lead уже вернул
+                        # лид в очередь ОЖИДАНИЯ (WAITING). НЕ переводим его в
+                        # таймерный перезвон, иначе лид простаивал бы. Проверим
+                        # снова на следующей итерации воркера (через интервал),
+                        # когда, возможно, кто-то освободится.
+                        pass
+                    else:
+                        # Менеджеры были, но callback не создался (сбой Sipuni)
+                        # или иной исход → перезвон по таймеру (+5/+15/+30).
+                        # Это реальная неудача попытки дозвона.
                         await schedule_autodial(
                             lead_id, phone, current_attempts=attempts,
                             lead_name=lead_name, lead_source=lead_source,
