@@ -551,6 +551,38 @@ async def cancel_autodial(lead_id: int, _: None = Depends(require_auth)):
     }
 
 
+@app.post("/autodial/clear")
+async def clear_autodial_queue(_: None = Depends(require_auth)):
+    """Очистить ВСЮ очередь автодозвона одним кликом — убрать все лиды в любом
+    состоянии (WAITING + SCHEDULED + IN_PROGRESS). Нужно, когда в очередь
+    налетел мусор (например, холодные лиды, пока менеджеров не было на линии).
+
+    Без комментов в Bitrix — массово это были бы десятки запросов. Просто
+    убираем из очереди и закрываем незавершённые сессии.
+    """
+    async with async_session_maker() as session:
+        # сколько было — для ответа
+        cnt = (await session.execute(
+            select(func.count()).select_from(AutodialQueue)
+        )).scalar_one()
+        # вычищаем всю очередь
+        await session.execute(delete(AutodialQueue))
+        # закрываем незавершённые сессии, чтобы Sipuni webhook их не подхватил
+        s = await session.execute(
+            select(CallSession).where(
+                CallSession.state.in_(["PENDING", "CALLBACK_CREATED"])
+            )
+        )
+        closed = 0
+        for sess in s.scalars().all():
+            sess.state = "ERROR"
+            closed += 1
+        await session.commit()
+
+    logger.info("[clear] очередь очищена: убрано %d, закрыто сессий %d", cnt, closed)
+    return {"ok": True, "removed_from_queue": int(cnt), "closed_sessions": closed}
+
+
 @app.get("/live/active-calls")
 async def live_active_calls(_: None = Depends(require_auth)):
     """Кто сейчас на звонке. Берём свежие сессии в работе (CALLBACK_CREATED —

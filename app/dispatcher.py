@@ -416,6 +416,7 @@ async def _enqueue_waiting(
     attempts: int = 0,
     lead_name: Optional[str] = None,
     lead_source: Optional[str] = None,
+    insert_if_missing: bool = True,
 ) -> bool:
     now = datetime.utcnow()
     async with async_session_maker() as session:
@@ -431,7 +432,7 @@ async def _enqueue_waiting(
             item.next_call_time = now          # готов сразу
             item.state = "WAITING"
             # attempts НЕ трогаем — ожидание не списывает попытку дозвона
-        else:
+        elif insert_if_missing:
             session.add(
                 AutodialQueue(
                     lead_id=lead_id,
@@ -443,6 +444,11 @@ async def _enqueue_waiting(
                     state="WAITING",
                 )
             )
+        else:
+            # Строки в очереди нет, и вставлять нельзя. Так бывает, когда лид
+            # отменили/очистили из дашборда, ПОКА воркер обрабатывал его батч.
+            # Не воскрешаем — отмена/очистка должны побеждать воркер.
+            return False
         try:
             await session.commit()
         except Exception as e:
@@ -513,10 +519,16 @@ async def process_new_lead(
     lead_source: Optional[str] = None,
     is_autodial: bool = False,
     received_at: Optional[datetime] = None,
+    from_queue: bool = False,
 ) -> Dict:
     """
     received_at — когда webhook пришёл от Bitrix. Используется для метрики
     «время реакции» (от webhook'а до первого callback'а).
+
+    from_queue=True — лид пришёл из очереди (воркер его перепроверяет). Тогда,
+    если свободного менеджера нет, мы НЕ создаём новую строку очереди заново,
+    а лишь обновляем существующую. Если строки уже нет (лид отменили/очистили
+    из дашборда), лид не воскрешаем — отмена/очистка побеждают воркер.
     """
     if not await _acquire_lead(lead_id):
         logger.info("[dispatch] лид %d уже обрабатывается", lead_id)
@@ -575,6 +587,7 @@ async def process_new_lead(
                 lead_id, client_phone,
                 attempts=0,
                 lead_name=lead_name, lead_source=lead_source,
+                insert_if_missing=not from_queue,
             )
             if first_time:
                 logger.warning(
@@ -959,6 +972,7 @@ async def autodial_worker() -> None:
                         lead_name=lead_name,
                         lead_source=lead_source,
                         is_autodial=True,
+                        from_queue=True,
                     )
                     status = res.get("status")
                     if status == "callback_created":
