@@ -138,6 +138,10 @@
   .row > * { flex:1; margin:0; }
   .open-bx { background:var(--field); color:var(--text); border:1px solid var(--field-bd); box-shadow:none; }
   .open-bx:hover { background:var(--surface); }
+  .ready-btn { background:var(--green); color:#04150e; font-weight:700; font-size:16px;
+    box-shadow:0 6px 20px rgba(52,211,153,0.32); margin-top:4px; }
+  .ready-btn:hover { background:var(--green); filter:brightness(1.06); }
+  .wrap-hint { font-size:12.5px; color:var(--text-dim); text-align:center; margin-top:9px; }
   /* leads list */
   .lead-item { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--border); cursor:pointer; transition:background .15s; }
   .lead-item:last-child { border-bottom:none; }
@@ -231,6 +235,8 @@
             <button class="ghost" onclick="addTask()">Поставить задачу</button>
           </div>
           <button class="open-bx" onclick="openBitrix()">Открыть в Bitrix</button>
+          <button class="ready-btn" id="ready-btn" onclick="markReady()" style="display:none">✓ Готов(а) звонить</button>
+          <div class="wrap-hint" id="wrap-hint" style="display:none">Заполните карточку и нажмите «Готов(а) звонить» — следующий звонок придёт только после этого.</div>
         </div>
       </div>
     </div>
@@ -311,18 +317,39 @@ async function pollCall(){
     const r=await fetch('/manager/api/current-call');
     if(r.status===401){doLogout();return;}
     const data=await r.json();
-    if(data&&data.lead_id)showCall(data); else hideCall();
+    if(data&&data.wrap_up)showCall(data,true);
+    else if(data&&data.lead_id)showCall(data,false);
+    else hideCall();
   }catch(e){}
 }
 let LAST_LEAD=null;
-async function showCall(call){
+async function showCall(call, wrapUp){
   document.getElementById('idle').style.display='none';
   const card=document.getElementById('call-card'); card.style.display='block';
-  card.className='glass '+(call.connected?'connected':'ringing');
   const badge=document.getElementById('call-badge');
-  badge.className='badge '+(call.connected?'conn':'ring');
-  badge.innerHTML='<span class="bd"></span>'+(call.connected?'Соединён':'Звонок…');
-  if(ACTIVE_TAB!=='call'&&!call.connected){} // карточка живёт во вкладке Звонок
+  const readyBtn=document.getElementById('ready-btn');
+  const wrapHint=document.getElementById('wrap-hint');
+  if(wrapUp){
+    card.className='glass connected';
+    badge.className='badge conn';
+    badge.innerHTML='<span class="bd"></span>Завершение разговора';
+    readyBtn.style.display='block';
+    wrapHint.style.display='block';
+  } else {
+    card.className='glass '+(call.connected?'connected':'ringing');
+    badge.className='badge '+(call.connected?'conn':'ring');
+    badge.innerHTML='<span class="bd"></span>'+(call.connected?'Соединён':'Звонок…');
+    readyBtn.style.display='none';
+    wrapHint.style.display='none';
+  }
+  if(!call.lead_id){
+    // завершение, но карточку лида не нашли — показываем только призыв нажать «Готово»
+    document.getElementById('c-name').textContent='Звонок завершён';
+    document.getElementById('c-phone').textContent='';
+    document.getElementById('c-fields').innerHTML='';
+    LAST_LEAD=null; CURRENT_LEAD=null;
+    return;
+  }
   if(LAST_LEAD===call.lead_id){document.getElementById('c-phone').textContent=call.phone||'';return;}
   LAST_LEAD=call.lead_id; CURRENT_LEAD=call.lead_id;
   document.getElementById('c-phone').textContent=call.phone||'';
@@ -340,6 +367,16 @@ async function showCall(call){
     document.getElementById('c-fields').innerHTML=f.map(([k,v])=>`<div class="k">${k}</div><div class="v">${escapeHtml(v)}</div>`).join('');
     if(c.stage_id)document.getElementById('stage-select').value=c.stage_id;
   }catch(e){document.getElementById('c-name').textContent='Клиент';}
+}
+async function markReady(){
+  const btn=document.getElementById('ready-btn');
+  btn.disabled=true;
+  try{
+    const r=await fetch('/manager/api/ready',{method:'POST'});
+    if(r.ok){ toast('Готово — звонки снова идут вам'); hideCall(); }
+    else toast('Ошибка',true);
+  }catch(e){toast('Ошибка соединения',true);}
+  finally{ btn.disabled=false; }
 }
 function hideCall(){document.getElementById('call-card').style.display='none';document.getElementById('idle').style.display='block';LAST_LEAD=null;CURRENT_LEAD=null;}
 

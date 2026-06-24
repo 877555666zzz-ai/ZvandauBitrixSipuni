@@ -52,6 +52,7 @@ from .dispatcher import (
     mark_busy_from_sipuni,
     normalize_phone,
     process_new_lead,
+    set_manager_ready,
     worker_last_tick,
 )
 from .models import AutodialQueue, CallLog, CallSession, Manager
@@ -1192,6 +1193,17 @@ async def portal_current_call(mgr_session: Optional[str] = Cookie(default=None))
         raise HTTPException(status_code=401, detail="no session")
     call = await portal.get_current_call(mgr.id)
     return call or {}
+
+
+@app.post("/manager/api/ready", include_in_schema=False)
+async def portal_ready(mgr_session: Optional[str] = Cookie(default=None)):
+    """Оператор нажал «Готов(а) звонить» — снимаем режим «Завершение»,
+    оператор снова получает звонки."""
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    was_wrap = await set_manager_ready(mgr.id)
+    return {"ok": True, "was_wrap_up": was_wrap}
 
 
 @app.get("/manager/api/card/{lead_id}", include_in_schema=False)
