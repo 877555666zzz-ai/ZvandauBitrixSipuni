@@ -38,6 +38,10 @@ class Manager(Base):
     password_hash = Column(String, nullable=True)
 
     online = Column(Boolean, default=True, nullable=False)
+    # Ручная бессрочная пауза: оператор «отошёл» — звонки не идут, пока сам
+    # не нажмёт «Возобновить». В отличие от busy_until (передышка на N секунд),
+    # пауза не имеет таймера и держится до явного снятия.
+    paused = Column(Boolean, default=False, nullable=False)
     missed = Column(Integer, default=0, nullable=False)
     accepted_calls = Column(Integer, default=0, nullable=False)
 

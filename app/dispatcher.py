@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status, update_deal_stage, assign_deal_responsible
@@ -158,60 +158,24 @@ async def _get_available_managers(exclude_manager_id: Optional[int] = None) -> L
         )
         managers = list(result.scalars().all())
     # Отсеиваем занятых: busy_until в будущем = ещё на звонке/в передышке.
+    # Отсеиваем на ручной паузе (paused) — оператор «отошёл».
     # И при необходимости исключаем конкретного оператора (того, кто только
     # что не ответил — чтобы каскад шёл к следующему, а не звонил тому же).
     free = [
         m for m in managers
         if (getattr(m, "busy_until", None) is None or m.busy_until <= now)
+        and not getattr(m, "paused", False)
         and (exclude_manager_id is None or m.id != exclude_manager_id)
     ]
     return sort_managers(free)
 
 
-async def _try_claim_manager(manager_id: int) -> bool:
-    """Атомарно «занять» свободного оператора ПЕРЕД звонком.
-
-    Защита от гонки: воркер и каскад (handle_sipuni_status) могут одновременно
-    выбрать одного и того же свободного оператора для РАЗНЫХ лидов и оба
-    отправить ему callback — тогда ему прилетят два звонка разом. Чтобы этого
-    не было, бронируем оператора одним атомарным UPDATE с условием «он сейчас
-    свободен». Если строка обновилась (rowcount=1) — мы его заняли первыми и
-    можно звонить. Если 0 — его уже забрал другой лид, берём следующего.
-
-    Условие на уровне БД (Postgres блокирует строку на UPDATE) гарантирует,
-    что бронь получит только один из конкурентов.
-    """
-    now = datetime.utcnow()
-    busy_until = now + timedelta(seconds=_BUSY_GUARD_SECONDS)
-    async with async_session_maker() as session:
-        result = await session.execute(
-            update(Manager)
-            .where(
-                Manager.id == manager_id,
-                Manager.online.is_(True),
-                or_(Manager.busy_until.is_(None), Manager.busy_until <= now),
-            )
-            .values(busy_until=busy_until)
-        )
-        await session.commit()
-        return result.rowcount == 1
-
-
-async def _release_claim(manager_id: int) -> None:
-    """Снять нашу бронь с оператора, если callback так и не создался — он не
-    занят (Sipuni отклонил вызов), пусть будет свободен для другого лида.
-    Оператора в «Завершении» не трогаем."""
-    async with async_session_maker() as session:
-        mgr = await session.get(Manager, manager_id)
-        if mgr and not is_wrap_up(getattr(mgr, "busy_until", None)):
-            mgr.busy_until = None
-            await session.commit()
-
-
 # Сколько секунд менеджер «занят» после старта звонка (страховка от залипания).
 _BUSY_GUARD_SECONDS = 180
-# Передышка после завершения звонка перед новым.
-_COOLDOWN_SECONDS = 5
+# «Передышка» после завершения звонка перед новым — чтобы оператор успел
+# дозаполнить карточку. Берётся из настроек (по умолчанию 60с). Оператор может
+# закончить раньше кнопкой «Готов принимать».
+_COOLDOWN_SECONDS = settings.MANAGER_BREATHER_SECONDS
 
 
 async def _set_busy(manager_id: int, seconds: int) -> None:
@@ -230,66 +194,6 @@ async def _release_after_cooldown(manager_id: int) -> None:
         if mgr:
             mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
             await session.commit()
-
-
-# ─────────────────────────────────────────────
-# Режим «Завершение» (after-call work / передышка)
-# ─────────────────────────────────────────────
-# После РЕАЛЬНОГО разговора оператор НЕ освобождается автоматически — он
-# «зависает» в завершении, пока сам не нажмёт «Готов(а) звонить» на своей
-# странице. Так у него есть время дозаполнить карточку (стадия/коммент), и
-# следующий звонок не прилетает поверх недозаполненного.
-#
-# Реализация БЕЗ новых колонок и миграций: переиспользуем busy_until со
-# специальным значением-маркером далеко в будущем. Для диспетчера это просто
-# «занят» (busy_until в будущем → оператор не попадает в список свободных),
-# поэтому отдельную ветку исключения добавлять не нужно. Отличаем «завершение»
-# от обычной занятости по порогу: реальная занятость — это минуты от now,
-# а маркер — 2099 год.
-_WRAP_UP_UNTIL = datetime(2099, 1, 1)          # маркер: держим до «Готово»
-_WRAP_UP_THRESHOLD = datetime(2090, 1, 1)      # busy_until >= порога → завершение
-
-
-def is_wrap_up(busy_until: Optional[datetime]) -> bool:
-    """True, если менеджер сейчас в режиме «Завершение» (держим до кнопки)."""
-    return busy_until is not None and busy_until >= _WRAP_UP_THRESHOLD
-
-
-async def enter_wrap_up(manager_id: int) -> None:
-    """Поставить оператора в «Завершение» — держим, пока не нажмёт «Готово».
-
-    Вызывается ТОЛЬКО после реального разговора (answered=True). Снять можно
-    лишь через set_manager_ready (кнопка оператора) — авто-возврата нет.
-    """
-    async with async_session_maker() as session:
-        mgr = await session.get(Manager, manager_id)
-        if mgr:
-            mgr.busy_until = _WRAP_UP_UNTIL
-            await session.commit()
-            logger.info(
-                "[wrap-up] оператор %s (id=%d) → завершение, ждём «Готово»",
-                mgr.name, manager_id,
-            )
-
-
-async def set_manager_ready(manager_id: int) -> bool:
-    """Оператор нажал «Готов(а) звонить» — снимаем завершение/занятость.
-
-    Возвращает True, если оператор реально был в завершении.
-    """
-    async with async_session_maker() as session:
-        mgr = await session.get(Manager, manager_id)
-        if not mgr:
-            return False
-        was_wrap = is_wrap_up(mgr.busy_until)
-        mgr.busy_until = None
-        await session.commit()
-        if was_wrap:
-            logger.info(
-                "[wrap-up] оператор %s (id=%d) нажал «Готово» → снова на линии",
-                mgr.name, manager_id,
-            )
-        return was_wrap
 
 
 async def mark_busy_from_sipuni(sipnumber: Optional[str], event_finished: bool) -> None:
@@ -316,12 +220,6 @@ async def mark_busy_from_sipuni(sipnumber: Optional[str], event_finished: bool) 
         mgr = result.scalars().first()
         if not mgr:
             return  # это не наш оператор — пропускаем
-        # Оператор в режиме «Завершение» — его занятость не трогаем вообще.
-        # Завершение снимается ТОЛЬКО кнопкой «Готово»; никакие события Sipuni
-        # (в т.ч. финал только что закончившегося звонка) не должны прерывать
-        # передышку и вернуть оператора в обзвон раньше времени.
-        if is_wrap_up(getattr(mgr, "busy_until", None)):
-            return
         if event_finished:
             # звонок завершён → освобождаем через передышку
             mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
@@ -731,16 +629,6 @@ async def process_new_lead(
         attempts: List[Dict] = []
 
         for manager in managers:
-            # Атомарно бронируем оператора ПЕРЕД звонком. Если в этот момент его
-            # уже занял другой лид (гонка воркер↔каскад) — бронь не пройдёт,
-            # берём следующего. Так один оператор не получит два звонка разом.
-            if not await _try_claim_manager(manager.id):
-                logger.info(
-                    "[dispatch] лид %d: оператор %s уже занят (гонка) — следующий",
-                    lead_id, manager.name,
-                )
-                continue
-
             logger.info(
                 "[dispatch] лид %d → callback %s (ext=%s)",
                 lead_id, manager.name, manager.sipnumber,
@@ -785,9 +673,9 @@ async def process_new_lead(
                 await _reset_missed(manager.id)
                 await _mark_accepted(manager.id)
                 await record_outcome(manager.id, success=True)
-                # Оператор уже забронирован (_try_claim_manager) — обновлять
-                # busy_until не нужно. Снимется через 5с после завершения звонка
-                # (или уйдёт в «Завершение», если реально поговорили).
+                # Менеджер занят на время звонка (страховка 3 мин от залипания,
+                # реально снимется через 5с после завершения звонка).
+                await _set_busy(manager.id, _BUSY_GUARD_SECONDS)
 
                 await _log_call(
                     lead_id=lead_id, phone=client_phone, call_type=call_type,
@@ -819,9 +707,7 @@ async def process_new_lead(
                     "attempts": attempts,
                 }
 
-            # Callback не создан (Sipuni отклонил) → снимаем бронь, оператор
-            # свободен для другого лида, и пробуем следующего.
-            await _release_claim(manager.id)
+            # Не приняли — пробуем следующего
             await record_outcome(manager.id, success=False)
             await _increment_missed(manager.id)
             await asyncio.sleep(settings.MANAGER_ANSWER_TIMEOUT_SECONDS)
@@ -948,11 +834,7 @@ async def handle_sipuni_status(
             if s.manager_sipnumber:
                 await assign_deal_responsible(s.lead_id, s.manager_sipnumber)
             if s.manager_id:
-                # Реальный разговор закончился → оператор уходит в «Завершение»:
-                # держим его (новые звонки не шлём), пока сам не нажмёт
-                # «Готов(а) звонить». Так успевает дозаполнить карточку, и
-                # следующий лид не прилетает поверх. Снимается ТОЛЬКО кнопкой.
-                await enter_wrap_up(s.manager_id)
+                await _release_after_cooldown(s.manager_id)
             logger.info(
                 "[sipuni-webhook] лид %d CONNECTED (%.0fс)",
                 s.lead_id, talk_seconds or 0,
@@ -1057,84 +939,6 @@ async def handle_sipuni_status(
 # ─────────────────────────────────────────────
 # Worker
 # ─────────────────────────────────────────────
-# Сторож «зависших» звонков. Когда создан callback, лид удаляется из очереди,
-# а сессия ждёт финальный вебхук Sipuni («поговорили / не ответил»). Если этот
-# вебхук не дойдёт (сбой связи/Sipuni) — лид иначе пропал бы навсегда: в очереди
-# его уже нет, сессию никто не закрывает. Сторож закрывает такие «висящие»
-# сессии и возвращает лид в работу.
-#
-# Безопасность по времени:
-#   • Оператор НЕ взял трубку (connected_at пуст) → клиента не набирали (звоним
-#     сначала оператору). Висит дольше _STALE_NO_PICKUP_MINUTES → лид безопасно
-#     вернуть в очередь ожидания (клиента это не дёргает).
-#   • Оператор ВЗЯЛ трубку (connected_at заполнен) → шёл реальный разговор.
-#     Его НЕ перезваниваем (клиента могли уже отговорить, оператор уже назначен
-#     ответственным в Bitrix — лид не теряется). Просто закрываем зависшую
-#     сессию спустя _STALE_CONNECTED_MINUTES, чтобы не копилась.
-_STALE_NO_PICKUP_MINUTES = 5
-_STALE_CONNECTED_MINUTES = 30
-
-
-async def _sweep_stale_sessions() -> None:
-    """Вернуть в работу лиды, чьи звонки «зависли» (потерян вебхук Sipuni)."""
-    now = datetime.utcnow()
-    no_pickup_cutoff = now - timedelta(minutes=_STALE_NO_PICKUP_MINUTES)
-    connected_cutoff = now - timedelta(minutes=_STALE_CONNECTED_MINUTES)
-
-    async with async_session_maker() as session:
-        result = await session.execute(
-            select(CallSession).where(CallSession.state == "CALLBACK_CREATED")
-        )
-        sessions = list(result.scalars().all())
-
-    for s in sessions:
-        started = s.started_at or now
-        connected = s.connected_at is not None
-        cutoff = connected_cutoff if connected else no_pickup_cutoff
-        if started > cutoff:
-            continue  # ещё не «протух» — ждём вебхук
-
-        # Атомарно закрываем сессию (чтобы не обработать дважды и чтобы
-        # handle_sipuni_status её больше не подхватил).
-        async with async_session_maker() as session:
-            cur = await session.get(CallSession, s.id)
-            if not cur or cur.state != "CALLBACK_CREATED":
-                continue
-            cur.state = "ERROR"
-            await session.commit()
-
-        if connected:
-            # Разговор был — лид не теряем (оператор уже ответственный),
-            # просто фиксируем и закрываем. Не перезваниваем клиенту.
-            logger.warning(
-                "[watchdog] лид %d: разговор без финального вебхука (%s) — "
-                "сессия закрыта, лид у оператора %s",
-                s.lead_id, started.strftime("%H:%M:%S"), s.manager_name,
-            )
-            await _log_call(
-                lead_id=s.lead_id, phone=s.phone, call_type="autodial",
-                status="connected", attempts=[],
-                manager_id=s.manager_id, manager_name=s.manager_name,
-                message="Зависший звонок (нет финального вебхука Sipuni) — закрыт",
-            )
-            continue
-
-        # Оператор не взял трубку и вебхук потерян → безопасно вернуть в очередь.
-        await _enqueue_waiting(s.lead_id, s.phone, attempts=s.attempts_used)
-        await update_lead_status(s.lead_id, "retry")
-        await _log_call(
-            lead_id=s.lead_id, phone=s.phone, call_type="autodial",
-            status="no_answer", attempts=[],
-            manager_id=s.manager_id, manager_name=s.manager_name,
-            message="Зависший звонок (нет финального вебхука Sipuni) — "
-                    "лид возвращён в очередь",
-        )
-        logger.warning(
-            "[watchdog] лид %d: callback завис без ответа (с %s) → возврат в очередь",
-            s.lead_id, started.strftime("%H:%M:%S"),
-        )
-
-
 # Heartbeat: воркер обновляет эту метку в начале каждой итерации цикла.
 # Дашборд по ней понимает, жив ли воркер (если метка свежая — жив).
 _worker_last_tick: Optional[datetime] = None
@@ -1153,14 +957,6 @@ async def autodial_worker() -> None:
     while True:
         _worker_last_tick = datetime.utcnow()
         try:
-            # Сторож зависших звонков — выполняем каждый тик, в т.ч. вне рабочих
-            # часов (потерянный вечером вебхук не должен потерять лид). Свой
-            # try, чтобы сбой сторожа не ронял основной цикл раздачи.
-            try:
-                await _sweep_stale_sessions()
-            except Exception as e:
-                logger.error("[watchdog] ошибка сторожа: %s", e, exc_info=True)
-
             # Вне рабочего окна 11:00–21:00 (Алматы) очередь не обзваниваем —
             # отложенные лиды дождутся открытия. Гарантия: ночью клиентам
             # не звоним ни по новым лидам, ни из очереди.

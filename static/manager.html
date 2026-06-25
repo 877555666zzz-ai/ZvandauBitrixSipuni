@@ -58,6 +58,35 @@
     box-shadow:var(--shadow); backdrop-filter:blur(18px) saturate(140%);
     -webkit-backdrop-filter:blur(18px) saturate(140%);
   }
+  /* Ready strip (всегда сверху, не исчезает) */
+  .ready-strip {
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:13px 18px; margin-bottom:14px; border-radius:16px;
+    border:1px solid var(--border); transition:background .25s,border-color .25s;
+  }
+  .ready-strip.s-ready  { background:var(--green-bg); border-color:rgba(52,211,153,0.35); }
+  .ready-strip.s-break  { background:rgba(251,191,36,0.12); border-color:rgba(251,191,36,0.38); }
+  .ready-strip.s-pause  { background:rgba(248,113,113,0.12); border-color:rgba(248,113,113,0.38); }
+  .ready-strip.s-off    { background:var(--field); border-color:var(--field-bd); }
+  .rs-left { display:flex; align-items:center; gap:11px; min-width:0; }
+  .rs-dot { width:11px; height:11px; border-radius:50%; flex:none; }
+  .s-ready .rs-dot { background:var(--green); box-shadow:0 0 12px var(--green); }
+  .s-break .rs-dot { background:var(--amber); box-shadow:0 0 12px var(--amber); animation:rsPulse 1s infinite; }
+  .s-pause .rs-dot { background:var(--red); box-shadow:0 0 12px var(--red); }
+  .s-off   .rs-dot { background:var(--text-faint); }
+  @keyframes rsPulse { 50%{opacity:.4;} }
+  .rs-title { font-size:14.5px; font-weight:600; letter-spacing:-0.2px; }
+  .rs-sub { font-size:12px; color:var(--text-dim); margin-top:1px; }
+  .rs-btn {
+    width:auto; margin:0; padding:10px 18px; font-size:13.5px; font-weight:700;
+    border-radius:11px; box-shadow:none; flex:none; border:1px solid transparent;
+  }
+  .rs-btn.b-pause  { background:var(--field); color:var(--text); border-color:var(--field-bd); box-shadow:none; }
+  .rs-btn.b-pause:hover { background:var(--surface); }
+  .rs-btn.b-resume { background:var(--green); color:#04150e; }
+  .rs-btn.b-resume:hover { filter:brightness(1.07); background:var(--green); }
+  .rs-btn.b-ready  { background:var(--amber); color:#231a02; }
+  .rs-btn.b-ready:hover { filter:brightness(1.07); background:var(--amber); }
   /* Login */
   #login-view { max-width:380px; margin:9vh auto 0; }
   .login-card { padding:30px 28px; }
@@ -194,6 +223,17 @@
   </div>
 
   <div id="work-view">
+    <div class="ready-strip s-ready glass" id="ready-strip">
+      <div class="rs-left">
+        <span class="rs-dot"></span>
+        <div>
+          <div class="rs-title" id="rs-title">Готов · принимаю звонки</div>
+          <div class="rs-sub" id="rs-sub">Звонки приходят вам</div>
+        </div>
+      </div>
+      <button class="rs-btn b-pause" id="rs-btn" onclick="onReadyBtn()">Пауза</button>
+    </div>
+
     <div class="glass topbar">
       <div>
         <div class="who" id="who"></div>
@@ -276,7 +316,93 @@ function toggleTheme(){const h=document.documentElement;const n=h.getAttribute('
 function toast(m,e){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(e?'err':'ok');setTimeout(()=>t.className='toast',2500);}
 function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+/* ===== Звук входящего звонка ===== */
+let AUDIO_CTX=null;
+function unlockAudio(){
+  try{
+    if(!AUDIO_CTX){ AUDIO_CTX=new (window.AudioContext||window.webkitAudioContext)(); }
+    if(AUDIO_CTX.state==='suspended') AUDIO_CTX.resume();
+  }catch(e){}
+}
+function playDing(){
+  try{
+    if(!AUDIO_CTX){ unlockAudio(); }
+    if(!AUDIO_CTX) return;
+    const now=AUDIO_CTX.currentTime;
+    [880,1320].forEach((freq,i)=>{
+      const o=AUDIO_CTX.createOscillator(), g=AUDIO_CTX.createGain();
+      o.type='sine'; o.frequency.value=freq;
+      const t=now+i*0.18;
+      g.gain.setValueAtTime(0,t);
+      g.gain.linearRampToValueAtTime(0.22,t+0.02);
+      g.gain.exponentialRampToValueAtTime(0.001,t+0.16);
+      o.connect(g); g.connect(AUDIO_CTX.destination);
+      o.start(t); o.stop(t+0.18);
+    });
+  }catch(e){}
+}
+
+/* ===== Полоса готовности / передышка / пауза ===== */
+let MES={online:true,paused:false,ready:true,breather_seconds_left:0};
+let ME_POLL=null, TICK=null, BUSY_BTN=false;
+function renderStrip(){
+  const strip=document.getElementById('ready-strip');
+  const title=document.getElementById('rs-title');
+  const sub=document.getElementById('rs-sub');
+  const btn=document.getElementById('rs-btn');
+  if(!strip) return;
+  let cls,t,s,bcls,blabel;
+  if(!MES.online){
+    cls='s-off'; t='Не на линии'; s='Звонки не приходят'; bcls='b-resume'; blabel='Готов';
+  } else if(MES.paused){
+    cls='s-pause'; t='Пауза · вы отошли'; s='Звонки приостановлены'; bcls='b-resume'; blabel='Возобновить';
+  } else if(MES.breather_seconds_left>0){
+    cls='s-break'; t='Передышка · '+MES.breather_seconds_left+'с'; s='Следующий звонок — после паузы'; bcls='b-ready'; blabel='Готов раньше';
+  } else {
+    cls='s-ready'; t='Готов · принимаю звонки'; s='Звонки приходят вам'; bcls='b-pause'; blabel='Пауза';
+  }
+  strip.className='ready-strip glass '+cls;
+  title.textContent=t; sub.textContent=s;
+  btn.className='rs-btn '+bcls; btn.textContent=blabel;
+}
+async function pollMe(){
+  try{
+    const r=await fetch('/manager/api/me');
+    if(!r.ok) return;
+    const d=await r.json();
+    MES.online=!!d.online; MES.paused=!!d.paused;
+    MES.ready=!!d.ready; MES.breather_seconds_left=d.breather_seconds_left||0;
+    renderStrip();
+  }catch(e){}
+}
+function tickStrip(){
+  // локальный отсчёт передышки между опросами /me
+  if(!MES.paused && MES.online && MES.breather_seconds_left>0){
+    MES.breather_seconds_left-=1; renderStrip();
+  }
+}
+async function onReadyBtn(){
+  if(BUSY_BTN) return; BUSY_BTN=true;
+  const btn=document.getElementById('rs-btn'); btn.disabled=true;
+  unlockAudio();
+  let url;
+  if(!MES.online || MES.paused) url='/manager/api/resume';
+  else if(MES.breather_seconds_left>0) url='/manager/api/ready-now';
+  else url='/manager/api/pause';
+  try{
+    const r=await fetch(url,{method:'POST'});
+    if(r.ok){
+      if(url.endsWith('/pause')){ MES.paused=true; toast('Пауза — звонки не приходят'); }
+      else if(url.endsWith('/resume')){ MES.paused=false; MES.online=true; MES.breather_seconds_left=0; toast('Возобновлено — вы готовы'); }
+      else { MES.breather_seconds_left=0; toast('Готов — звонки идут вам'); }
+      renderStrip();
+    } else toast('Ошибка',true);
+  }catch(e){ toast('Ошибка соединения',true); }
+  finally{ btn.disabled=false; BUSY_BTN=false; pollMe(); }
+}
+
 async function doLogin(){
+  unlockAudio();
   const login=document.getElementById('login').value.trim();
   const password=document.getElementById('password').value;
   const err=document.getElementById('login-error'); err.textContent='';
@@ -288,7 +414,8 @@ async function doLogin(){
 }
 async function doLogout(){
   try{await fetch('/manager/api/logout',{method:'POST'});}catch(e){}
-  if(POLL)clearInterval(POLL); ME=null;CURRENT_LEAD=null;
+  if(POLL)clearInterval(POLL); if(ME_POLL)clearInterval(ME_POLL); if(TICK)clearInterval(TICK);
+  ME=null;CURRENT_LEAD=null;
   document.getElementById('work-view').style.display='none';
   document.getElementById('login-view').style.display='block';
   document.getElementById('password').value='';
@@ -311,7 +438,11 @@ function switchTab(tab){
   if(tab==='leads')loadLeads();
   if(tab==='profile')loadProfile();
 }
-function startPolling(){ if(POLL)clearInterval(POLL); pollCall(); POLL=setInterval(pollCall,2000); }
+function startPolling(){
+  if(POLL)clearInterval(POLL); pollCall(); POLL=setInterval(pollCall,2000);
+  if(ME_POLL)clearInterval(ME_POLL); pollMe(); ME_POLL=setInterval(pollMe,3000);
+  if(TICK)clearInterval(TICK); TICK=setInterval(tickStrip,1000);
+}
 async function pollCall(){
   try{
     const r=await fetch('/manager/api/current-call');
@@ -324,6 +455,10 @@ async function pollCall(){
 }
 let LAST_LEAD=null;
 async function showCall(call, wrapUp){
+  // звук при появлении НОВОГО входящего звонка (не на каждом опросе)
+  if(!wrapUp && call && call.lead_id && !call.connected && LAST_LEAD!==call.lead_id){
+    playDing();
+  }
   document.getElementById('idle').style.display='none';
   const card=document.getElementById('call-card'); card.style.display='block';
   const badge=document.getElementById('call-badge');
@@ -440,6 +575,7 @@ function openBitrix(){
 }
 (async function(){try{const r=await fetch('/manager/api/me');if(r.ok){ME=await r.json();showWork();}}catch(e){}})();
 document.getElementById('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+document.addEventListener('click',unlockAudio,{once:true});
 </script>
 </body>
 </html>

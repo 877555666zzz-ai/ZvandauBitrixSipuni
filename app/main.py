@@ -52,7 +52,6 @@ from .dispatcher import (
     mark_busy_from_sipuni,
     normalize_phone,
     process_new_lead,
-    set_manager_ready,
     worker_last_tick,
 )
 from .models import AutodialQueue, CallLog, CallSession, Manager
@@ -194,15 +193,23 @@ class ManagerUpdate(BaseModel):
 
 
 def _mgr_dict(m: Manager) -> dict:
+    paused = bool(getattr(m, "paused", False))
+    if not m.online:
+        status = "НЕ АКТИВЕН"
+    elif paused:
+        status = "ПАУЗА"
+    else:
+        status = "НА ЛИНИИ"
     return {
         "id": m.id,
         "name": m.name,
         "sipnumber": m.sipnumber,
         "online": bool(m.online),
+        "paused": paused,
         "missed": int(m.missed or 0),
         "accepted_calls": int(m.accepted_calls or 0),
         "priority_score": round(float(m.priority_score or 0.5), 3),
-        "status": "НА ЛИНИИ" if m.online else "НЕ АКТИВЕН",
+        "status": status,
     }
 
 
@@ -267,6 +274,10 @@ async def set_manager_online(manager_id: int, _: None = Depends(require_auth)):
             raise HTTPException(status_code=404, detail="manager_not_found")
         mgr.online = True
         mgr.missed = 0
+        # «На линию» = полностью активен: снимаем ручную паузу и передышку,
+        # чтобы оператор сразу был готов принимать.
+        mgr.paused = False
+        mgr.busy_until = None
         await session.commit()
         await session.refresh(mgr)
     return _mgr_dict(mgr)
@@ -646,6 +657,8 @@ async def all_managers_online(_: None = Depends(require_auth)):
                 changed += 1
             m.online = True
             m.missed = 0
+            m.paused = False
+            m.busy_until = None
         await session.commit()
     logger.info("[bulk] все на линии (изменено %d из %d)", changed, len(rows))
     return {"ok": True, "set_online": changed, "total": len(rows)}
@@ -1153,8 +1166,17 @@ class PortalLogin(BaseModel):
 
 
 def _mgr_public(m: Manager) -> dict:
+    now = datetime.utcnow()
+    breather_left = 0
+    if m.busy_until and m.busy_until > now:
+        breather_left = int((m.busy_until - now).total_seconds())
+    paused = bool(getattr(m, "paused", False))
     return {"id": m.id, "name": m.name, "sipnumber": m.sipnumber,
-            "online": bool(m.online)}
+            "online": bool(m.online),
+            "paused": paused,
+            "breather_seconds_left": breather_left,
+            # «готов» = на линии, не на паузе и не в передышке
+            "ready": bool(m.online) and not paused and breather_left == 0}
 
 
 @app.post("/manager/api/login", include_in_schema=False)
@@ -1195,15 +1217,52 @@ async def portal_current_call(mgr_session: Optional[str] = Cookie(default=None))
     return call or {}
 
 
-@app.post("/manager/api/ready", include_in_schema=False)
-async def portal_ready(mgr_session: Optional[str] = Cookie(default=None)):
-    """Оператор нажал «Готов(а) звонить» — снимаем режим «Завершение»,
-    оператор снова получает звонки."""
+@app.post("/manager/api/ready-now", include_in_schema=False)
+async def portal_ready_now(mgr_session: Optional[str] = Cookie(default=None)):
+    """«Готов принимать» — закончить передышку раньше: снять busy_until, чтобы
+    автодозвон мог сразу прислать следующий звонок. Паузу НЕ трогает."""
     mgr = await portal.get_session_manager(mgr_session)
     if not mgr:
         raise HTTPException(status_code=401, detail="no session")
-    was_wrap = await set_manager_ready(mgr.id)
-    return {"ok": True, "was_wrap_up": was_wrap}
+    async with async_session_maker() as session:
+        m = await session.get(Manager, mgr.id)
+        if m:
+            m.busy_until = None
+            await session.commit()
+    logger.info("[breather] оператор %s готов принимать (передышка снята)", mgr.name)
+    return {"ok": True, "ready": True, "breather_seconds_left": 0}
+
+
+@app.post("/manager/api/pause", include_in_schema=False)
+async def portal_pause(mgr_session: Optional[str] = Cookie(default=None)):
+    """«Пауза» — оператор отошёл. Бессрочно: звонки не идут, пока не нажмёт
+    «Возобновить»."""
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    async with async_session_maker() as session:
+        m = await session.get(Manager, mgr.id)
+        if m:
+            m.paused = True
+            await session.commit()
+    logger.info("[pause] оператор %s ушёл на паузу", mgr.name)
+    return {"ok": True, "paused": True}
+
+
+@app.post("/manager/api/resume", include_in_schema=False)
+async def portal_resume(mgr_session: Optional[str] = Cookie(default=None)):
+    """«Возобновить» — снять паузу И передышку: оператор сразу готов."""
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    async with async_session_maker() as session:
+        m = await session.get(Manager, mgr.id)
+        if m:
+            m.paused = False
+            m.busy_until = None
+            await session.commit()
+    logger.info("[pause] оператор %s возобновил приём", mgr.name)
+    return {"ok": True, "paused": False, "ready": True}
 
 
 @app.get("/manager/api/card/{lead_id}", include_in_schema=False)

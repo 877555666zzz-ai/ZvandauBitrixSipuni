@@ -47,11 +47,15 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE managers ADD COLUMN IF NOT EXISTS password_hash VARCHAR"
             ))
+            await conn.execute(text(
+                "ALTER TABLE managers ADD COLUMN IF NOT EXISTS paused BOOLEAN DEFAULT FALSE"
+            ))
         else:
             for col, typ in (
                 ("busy_until", "TIMESTAMP"),
                 ("login", "VARCHAR"),
                 ("password_hash", "VARCHAR"),
+                ("paused", "BOOLEAN DEFAULT 0"),
             ):
                 try:
                     await conn.execute(text(
