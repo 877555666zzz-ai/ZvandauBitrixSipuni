@@ -158,12 +158,13 @@ async def _get_available_managers(exclude_manager_id: Optional[int] = None) -> L
         )
         managers = list(result.scalars().all())
     # Отсеиваем занятых: busy_until в будущем = ещё на звонке/в передышке.
+    # Отсеиваем «на звонке» (on_call) — даже если guard-таймер истёк на длинном
+    # разговоре, пока звонок не завершён, второй звонок оператору НЕ шлём.
     # Отсеиваем на ручной паузе (paused) — оператор «отошёл».
-    # И при необходимости исключаем конкретного оператора (того, кто только
-    # что не ответил — чтобы каскад шёл к следующему, а не звонил тому же).
     free = [
         m for m in managers
         if (getattr(m, "busy_until", None) is None or m.busy_until <= now)
+        and not getattr(m, "on_call", False)
         and not getattr(m, "paused", False)
         and (exclude_manager_id is None or m.id != exclude_manager_id)
     ]
@@ -178,21 +179,36 @@ _BUSY_GUARD_SECONDS = 180
 _COOLDOWN_SECONDS = settings.MANAGER_BREATHER_SECONDS
 
 
-async def _set_busy(manager_id: int, seconds: int) -> None:
-    """Пометить менеджера занятым на N секунд вперёд."""
+# Глобальный замок диспетчеризации: атомарно «выбрать свободного + зарезервировать»,
+# чтобы два почти одновременных лида не выбрали одного оператора и не прислали ему
+# два звонка. Под замком — ТОЛЬКО быстрый выбор+резерв (без сетевых вызовов).
+_DISPATCH_LOCK = asyncio.Lock()
+
+
+async def _set_busy(manager_id: int, seconds: int, on_call: Optional[bool] = None) -> None:
+    """Пометить менеджера занятым на N секунд вперёд.
+
+    on_call=True  — оператор сейчас на звонке (не показываем передышку);
+    on_call=False — звонок закончился (с этого момента busy_until = передышка).
+    on_call=None  — флаг не трогаем.
+    """
     async with async_session_maker() as session:
         mgr = await session.get(Manager, manager_id)
         if mgr:
             mgr.busy_until = datetime.utcnow() + timedelta(seconds=seconds)
+            if on_call is not None:
+                mgr.on_call = on_call
             await session.commit()
 
 
 async def _release_after_cooldown(manager_id: int) -> None:
-    """Освободить менеджера через _COOLDOWN_SECONDS после завершения звонка."""
+    """Звонок завершён → стартует передышка (busy_until на _COOLDOWN_SECONDS),
+    on_call снимается (теперь это именно передышка, а не разговор)."""
     async with async_session_maker() as session:
         mgr = await session.get(Manager, manager_id)
         if mgr:
             mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
+            mgr.on_call = False
             await session.commit()
 
 
@@ -221,17 +237,19 @@ async def mark_busy_from_sipuni(sipnumber: Optional[str], event_finished: bool) 
         if not mgr:
             return  # это не наш оператор — пропускаем
         if event_finished:
-            # звонок завершён → освобождаем через передышку
+            # звонок завершён → освобождаем через передышку, снимаем on_call
             mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
+            mgr.on_call = False
             logger.info(
-                "[busy] оператор %s (sip=%s) освободился после звонка (+%dс)",
+                "[busy] оператор %s (sip=%s) освободился после звонка (+%dс передышка)",
                 mgr.name, sip, _COOLDOWN_SECONDS,
             )
         else:
-            # звонок начался/идёт → занят (со страховкой от залипания)
+            # звонок начался/идёт → занят и на звонке (страховка от залипания)
             mgr.busy_until = datetime.utcnow() + timedelta(seconds=_BUSY_GUARD_SECONDS)
+            mgr.on_call = True
             logger.info(
-                "[busy] оператор %s (sip=%s) занят — на линии",
+                "[busy] оператор %s (sip=%s) занят — на звонке",
                 mgr.name, sip,
             )
         await session.commit()
@@ -572,21 +590,24 @@ async def process_new_lead(
     received_at = received_at or datetime.utcnow()
 
     try:
-        managers = await _get_available_managers()
         call_type = "autodial" if is_autodial else "initial"
 
-        if not managers:
-            # Нет СВОБОДНОГО менеджера (все заняты или оффлайн). РАНЬШЕ лид
-            # улетал в таймерный перезвон (+5 мин) и простаивал, пока
-            # единственный оператор был на звонке. ТЕПЕРЬ лид встаёт в очередь
-            # ОЖИДАНИЯ (WAITING) и будет отдан первому же менеджеру, который
-            # освободится — воркер проверяет очередь часто. Так теплые лиды не
-            # простаивают, а операторы всегда заняты.
-            #
-            # Важно: клиенту в этой ветке мы ещё НЕ звонили (в callback-схеме
-            # клиент набирается только после ответа менеджера), поэтому держать
-            # лид в ожидании и быстро перезапускать дозвон безопасно — клиента
-            # это не дёргает.
+        # Атомарно выбираем и резервируем ОДНОГО свободного оператора под общим
+        # замком — чтобы два почти одновременных лида НЕ выбрали одного и того же
+        # и не прислали ему два звонка. В замке только быстрый выбор+резерв;
+        # сетевой вызов Sipuni делаем уже ВНЕ замка.
+        async with _DISPATCH_LOCK:
+            managers = await _get_available_managers()
+            manager = managers[0] if managers else None
+            if manager is not None:
+                await _set_busy(manager.id, _BUSY_GUARD_SECONDS, on_call=True)
+
+        if manager is None:
+            # Нет СВОБОДНОГО менеджера (все заняты/на звонке/на паузе/оффлайн).
+            # Лид встаёт в очередь ОЖИДАНИЯ (WAITING) и будет отдан первому же
+            # освободившемуся оператору (воркер проверяет очередь часто). Клиенту
+            # в этой ветке ещё НЕ звонили (звоним сначала менеджеру), поэтому
+            # держать лид в ожидании безопасно — клиента это не дёргает.
             first_time = await _enqueue_waiting(
                 lead_id, client_phone,
                 attempts=0,
@@ -617,115 +638,96 @@ async def process_new_lead(
                     f"все менеджеры заняты — лид в очереди ожидания"
                 )
             else:
-                # Повторная проверка воркером — лид уже ждёт, не спамим.
                 logger.info(
                     "[dispatch] лид %d: всё ещё нет свободных — ждёт в очереди",
                     lead_id,
                 )
             return {"ok": True, "status": "no_managers_available", "lead_id": lead_id}
 
+        # ── Звоним ОДНОМУ зарезервированному оператору (вне замка) ──────────
         await update_lead_status(lead_id, "dialing")
-
         attempts: List[Dict] = []
+        logger.info(
+            "[dispatch] лид %d → callback %s (ext=%s)",
+            lead_id, manager.name, manager.sipnumber,
+        )
+        callback_start = datetime.utcnow()
+        sipuni_resp = await make_outbound_call(manager.sipnumber, client_phone)
+        attempts.append({
+            "manager_id": manager.id,
+            "manager_name": manager.name,
+            "sipnumber": manager.sipnumber,
+            "sipuni_response": sipuni_resp,
+        })
 
-        for manager in managers:
-            logger.info(
-                "[dispatch] лид %d → callback %s (ext=%s)",
-                lead_id, manager.name, manager.sipnumber,
+        if sipuni_resp.get("callback_created"):
+            reaction = (callback_start - received_at).total_seconds()
+
+            # Создаём CallSession — будем ждать Sipuni webhook
+            async with async_session_maker() as session:
+                session.add(
+                    CallSession(
+                        lead_id=lead_id,
+                        phone=client_phone,
+                        manager_id=manager.id,
+                        manager_name=manager.name,
+                        manager_sipnumber=manager.sipnumber,
+                        state="CALLBACK_CREATED",
+                        callback_at=callback_start,
+                        is_autodial=is_autodial,
+                        attempts_used=len(attempts),
+                    )
+                )
+                await session.execute(
+                    delete(AutodialQueue).where(AutodialQueue.lead_id == lead_id)
+                )
+                await session.commit()
+
+            await _reset_missed(manager.id)
+            await _mark_accepted(manager.id)
+            await record_outcome(manager.id, success=True)
+            # Подтверждаем «на звонке» (резерв уже стоял; обновляем guard).
+            await _set_busy(manager.id, _BUSY_GUARD_SECONDS, on_call=True)
+
+            await _log_call(
+                lead_id=lead_id, phone=client_phone, call_type=call_type,
+                status="callback_created", attempts=attempts,
+                lead_name=lead_name, lead_source=lead_source,
+                manager_id=manager.id, manager_name=manager.name,
+                reaction_seconds=reaction,
+                message=f"Sipuni callback → {manager.name} (ext {manager.sipnumber})",
             )
 
-            callback_start = datetime.utcnow()
-            sipuni_resp = await make_outbound_call(manager.sipnumber, client_phone)
-            attempts.append({
+            await update_lead_status(lead_id, "connected")
+            await add_lead_comment(
+                lead_id,
+                f"Автодозвон: callback назначен менеджеру {manager.name} "
+                f"(ext. {manager.sipnumber}). Время реакции {reaction:.1f}с.",
+            )
+
+            logger.info(
+                "[dispatch] лид %d: callback %s | реакция %.1fс",
+                lead_id, manager.name, reaction,
+            )
+            return {
+                "ok": True,
+                "status": "callback_created",
+                "lead_id": lead_id,
                 "manager_id": manager.id,
                 "manager_name": manager.name,
-                "sipnumber": manager.sipnumber,
-                "sipuni_response": sipuni_resp,
-            })
+                "reaction_seconds": reaction,
+                "attempts": attempts,
+            }
 
-            if sipuni_resp.get("callback_created"):
-                reaction = (callback_start - received_at).total_seconds()
+        # Sipuni не принял callback (линия оператора занята/недоступна).
+        # Снимаем резерв этого оператора и кладём лид в очередь ОЖИДАНИЯ —
+        # воркер перевыберет свободного через ~15с. Перебирать остальных прямо
+        # сейчас НЕ нужно (это и создавало риск второго звонка по устаревшему
+        # списку): если оператор не ОТВЕТИТ — каскад сам передаст лида дальше.
+        await _set_busy(manager.id, 0, on_call=False)
+        await record_outcome(manager.id, success=False)
+        await _increment_missed(manager.id)
 
-                # Создаём CallSession — будем ждать Sipuni webhook
-                async with async_session_maker() as session:
-                    session.add(
-                        CallSession(
-                            lead_id=lead_id,
-                            phone=client_phone,
-                            manager_id=manager.id,
-                            manager_name=manager.name,
-                            manager_sipnumber=manager.sipnumber,
-                            state="CALLBACK_CREATED",
-                            callback_at=callback_start,
-                            is_autodial=is_autodial,
-                            attempts_used=len(attempts),
-                        )
-                    )
-                    # Чистим очередь
-                    await session.execute(
-                        delete(AutodialQueue).where(AutodialQueue.lead_id == lead_id)
-                    )
-                    await session.commit()
-
-                # MVP: считаем callback успехом для priority и accepted_calls.
-                # Когда придёт Sipuni webhook со статусом «не ответил» —
-                # значения скорректируются обратно.
-                await _reset_missed(manager.id)
-                await _mark_accepted(manager.id)
-                await record_outcome(manager.id, success=True)
-                # Менеджер занят на время звонка (страховка 3 мин от залипания,
-                # реально снимется через 5с после завершения звонка).
-                await _set_busy(manager.id, _BUSY_GUARD_SECONDS)
-
-                await _log_call(
-                    lead_id=lead_id, phone=client_phone, call_type=call_type,
-                    status="callback_created", attempts=attempts,
-                    lead_name=lead_name, lead_source=lead_source,
-                    manager_id=manager.id, manager_name=manager.name,
-                    reaction_seconds=reaction,
-                    message=f"Sipuni callback → {manager.name} (ext {manager.sipnumber})",
-                )
-
-                await update_lead_status(lead_id, "connected")
-                await add_lead_comment(
-                    lead_id,
-                    f"Автодозвон: callback назначен менеджеру {manager.name} "
-                    f"(ext. {manager.sipnumber}). Время реакции {reaction:.1f}с.",
-                )
-
-                logger.info(
-                    "[dispatch] лид %d: callback %s | реакция %.1fс",
-                    lead_id, manager.name, reaction,
-                )
-                return {
-                    "ok": True,
-                    "status": "callback_created",
-                    "lead_id": lead_id,
-                    "manager_id": manager.id,
-                    "manager_name": manager.name,
-                    "reaction_seconds": reaction,
-                    "attempts": attempts,
-                }
-
-            # Не приняли — пробуем следующего
-            await record_outcome(manager.id, success=False)
-            await _increment_missed(manager.id)
-            await asyncio.sleep(settings.MANAGER_ANSWER_TIMEOUT_SECONDS)
-
-        # Никто не принял
-        reaction = (datetime.utcnow() - received_at).total_seconds()
-        await _log_call(
-            lead_id=lead_id, phone=client_phone, call_type=call_type,
-            status="no_answer", attempts=attempts,
-            lead_name=lead_name, lead_source=lead_source,
-            reaction_seconds=reaction,
-            message="Никто не принял callback",
-        )
-
-        # Sipuni не принял callback ни к одному менеджеру (линия занята/недоступна).
-        # КЛИЕНТА ещё НЕ набирали — звоним сначала менеджеру. Значит это проблема
-        # доступности менеджера, а не клиента → в очередь ОЖИДАНИЯ (быстрый повтор
-        # при освобождении оператора), НЕ в таймерный перезвон.
         await _enqueue_waiting(
             lead_id, client_phone,
             attempts=0,
@@ -733,14 +735,17 @@ async def process_new_lead(
             insert_if_missing=not from_queue,
         )
         await update_lead_status(lead_id, "retry")
-
+        await _log_call(
+            lead_id=lead_id, phone=client_phone, call_type=call_type,
+            status="no_answer", attempts=attempts,
+            lead_name=lead_name, lead_source=lead_source,
+            message="Sipuni не принял callback — лид в очереди ожидания",
+        )
         logger.info(
-            "[dispatch] лид %d: callback не принят менеджером(ами) → очередь ожидания "
-            "(попыток callback=%d)", lead_id, len(attempts),
+            "[dispatch] лид %d: Sipuni не принял callback (%s) → очередь ожидания",
+            lead_id, manager.name,
         )
         return {
-            # Тот же статус, что и при отсутствии свободного менеджера — воркер
-            # тогда НЕ переводит лид в таймерный перезвон, а оставляет ждать.
             "ok": True,
             "status": "no_managers_available",
             "lead_id": lead_id,

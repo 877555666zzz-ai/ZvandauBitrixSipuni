@@ -194,8 +194,11 @@ class ManagerUpdate(BaseModel):
 
 def _mgr_dict(m: Manager) -> dict:
     paused = bool(getattr(m, "paused", False))
+    on_call = bool(getattr(m, "on_call", False))
     if not m.online:
         status = "НЕ АКТИВЕН"
+    elif on_call:
+        status = "НА ЗВОНКЕ"
     elif paused:
         status = "ПАУЗА"
     else:
@@ -206,6 +209,7 @@ def _mgr_dict(m: Manager) -> dict:
         "sipnumber": m.sipnumber,
         "online": bool(m.online),
         "paused": paused,
+        "on_call": on_call,
         "missed": int(m.missed or 0),
         "accepted_calls": int(m.accepted_calls or 0),
         "priority_score": round(float(m.priority_score or 0.5), 3),
@@ -278,6 +282,7 @@ async def set_manager_online(manager_id: int, _: None = Depends(require_auth)):
         # чтобы оператор сразу был готов принимать.
         mgr.paused = False
         mgr.busy_until = None
+        mgr.on_call = False
         await session.commit()
         await session.refresh(mgr)
     return _mgr_dict(mgr)
@@ -659,6 +664,7 @@ async def all_managers_online(_: None = Depends(require_auth)):
             m.missed = 0
             m.paused = False
             m.busy_until = None
+            m.on_call = False
         await session.commit()
     logger.info("[bulk] все на линии (изменено %d из %d)", changed, len(rows))
     return {"ok": True, "set_online": changed, "total": len(rows)}
@@ -1167,16 +1173,21 @@ class PortalLogin(BaseModel):
 
 def _mgr_public(m: Manager) -> dict:
     now = datetime.utcnow()
-    breather_left = 0
-    if m.busy_until and m.busy_until > now:
-        breather_left = int((m.busy_until - now).total_seconds())
     paused = bool(getattr(m, "paused", False))
+    on_call = bool(getattr(m, "on_call", False))
+    # Передышку считаем ТОЛЬКО когда оператор не на звонке. Пока on_call=True,
+    # busy_until — это страховка времени разговора (до 180с), а не передышка,
+    # поэтому отсчёт передышки не показываем.
+    breather_left = 0
+    if not on_call and m.busy_until and m.busy_until > now:
+        breather_left = int((m.busy_until - now).total_seconds())
     return {"id": m.id, "name": m.name, "sipnumber": m.sipnumber,
             "online": bool(m.online),
             "paused": paused,
+            "on_call": on_call,
             "breather_seconds_left": breather_left,
-            # «готов» = на линии, не на паузе и не в передышке
-            "ready": bool(m.online) and not paused and breather_left == 0}
+            # «готов» = на линии, не на паузе, не на звонке и не в передышке
+            "ready": bool(m.online) and not paused and not on_call and breather_left == 0}
 
 
 @app.post("/manager/api/login", include_in_schema=False)
@@ -1260,6 +1271,7 @@ async def portal_resume(mgr_session: Optional[str] = Cookie(default=None)):
         if m:
             m.paused = False
             m.busy_until = None
+            m.on_call = False
             await session.commit()
     logger.info("[pause] оператор %s возобновил приём", mgr.name)
     return {"ok": True, "paused": False, "ready": True}

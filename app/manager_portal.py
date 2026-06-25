@@ -101,55 +101,26 @@ async def destroy_session(token: Optional[str]) -> None:
 
 # ── Текущий звонок менеджера ─────────────────────────────────
 async def get_current_call(manager_id: int) -> Optional[dict]:
-    """Вернуть состояние рабочего экрана оператора (для всплытия карточки).
+    """Вернуть активный звонок оператора (для всплытия карточки).
 
-    Возможные ответы:
-      • активный звонок (идёт) — state CALLBACK_CREATED, badge «Звонок…»;
-      • режим «Завершение» (wrap_up=True) — разговор закончился, оператор
-        держится до нажатия «Готов(а) звонить»; показываем карточку только что
-        отговорённого лида + кнопку «Готово»;
-      • None — оператор свободен, экран ожидания.
-
-    «Завершение» определяется по busy_until-маркеру (см. dispatcher.is_wrap_up).
-    Это же значение исключает оператора из раздачи, так что новый звонок ему
-    не прилетит, пока он не нажал «Готово».
+    Карточка показывается, как только звонок НАЗНАЧЕН оператору
+    (CALLBACK_CREATED — его телефон звонит), ещё до соединения с клиентом,
+    и пока идёт разговор (CONNECTED). Берём самую свежую сессию этого
+    оператора в окне ACTIVE_CALL_WINDOW_SECONDS.
     """
-    from .dispatcher import is_wrap_up
-
     now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=ACTIVE_CALL_WINDOW_SECONDS)
     async with async_session_maker() as session:
-        mgr = await session.get(Manager, manager_id)
-        wrap = bool(mgr and is_wrap_up(getattr(mgr, "busy_until", None)))
-
-        if wrap:
-            # В завершении: показываем последнюю сессию этого оператора (только
-            # что закончившийся разговор), окно шире — карточку можно заполнять
-            # сколько нужно, она не пропадёт.
-            states = ["CONNECTED", "CALLBACK_CREATED"]
-            cutoff = now - timedelta(hours=12)
-        else:
-            # Не в завершении: показываем ТОЛЬКО активный (ещё идущий) звонок.
-            # Завершённые (CONNECTED) сессии сюда не попадают — экран ожидания.
-            states = ["CALLBACK_CREATED"]
-            cutoff = now - timedelta(seconds=ACTIVE_CALL_WINDOW_SECONDS)
-
         result = await session.execute(
             select(CallSession)
             .where(CallSession.manager_id == manager_id)
-            .where(CallSession.state.in_(states))
+            .where(CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]))
             .where(CallSession.started_at >= cutoff)
             .order_by(CallSession.started_at.desc())
         )
         s = result.scalars().first()
 
     if not s:
-        if wrap:
-            # Держим оператора, но свежей сессии не нашли — всё равно сигналим
-            # «Завершение», чтобы он видел кнопку «Готово» и не завис молча.
-            return {
-                "lead_id": None, "phone": None, "state": "WRAP_UP",
-                "connected": True, "wrap_up": True,
-            }
         return None
 
     return {
@@ -157,8 +128,7 @@ async def get_current_call(manager_id: int) -> Optional[dict]:
         "phone": s.phone,
         "state": s.state,
         "started_at": s.started_at.isoformat() + "Z" if s.started_at else None,
-        "connected": wrap or (s.state == "CONNECTED"),
-        "wrap_up": wrap,
+        "connected": s.state == "CONNECTED",
     }
 
 

@@ -67,12 +67,14 @@
   .ready-strip.s-ready  { background:var(--green-bg); border-color:rgba(52,211,153,0.35); }
   .ready-strip.s-break  { background:rgba(251,191,36,0.12); border-color:rgba(251,191,36,0.38); }
   .ready-strip.s-pause  { background:rgba(248,113,113,0.12); border-color:rgba(248,113,113,0.38); }
+  .ready-strip.s-call   { background:var(--blue-bg); border-color:rgba(79,143,247,0.40); }
   .ready-strip.s-off    { background:var(--field); border-color:var(--field-bd); }
   .rs-left { display:flex; align-items:center; gap:11px; min-width:0; }
   .rs-dot { width:11px; height:11px; border-radius:50%; flex:none; }
   .s-ready .rs-dot { background:var(--green); box-shadow:0 0 12px var(--green); }
   .s-break .rs-dot { background:var(--amber); box-shadow:0 0 12px var(--amber); animation:rsPulse 1s infinite; }
   .s-pause .rs-dot { background:var(--red); box-shadow:0 0 12px var(--red); }
+  .s-call  .rs-dot { background:var(--accent); box-shadow:0 0 12px var(--accent); animation:rsPulse 1s infinite; }
   .s-off   .rs-dot { background:var(--text-faint); }
   @keyframes rsPulse { 50%{opacity:.4;} }
   .rs-title { font-size:14.5px; font-weight:600; letter-spacing:-0.2px; }
@@ -343,7 +345,7 @@ function playDing(){
 }
 
 /* ===== Полоса готовности / передышка / пауза ===== */
-let MES={online:true,paused:false,ready:true,breather_seconds_left:0};
+let MES={online:true,paused:false,ready:true,breather_seconds_left:0,on_call:false};
 let ME_POLL=null, TICK=null, BUSY_BTN=false;
 function renderStrip(){
   const strip=document.getElementById('ready-strip');
@@ -356,6 +358,8 @@ function renderStrip(){
     cls='s-off'; t='Не на линии'; s='Звонки не приходят'; bcls='b-resume'; blabel='Готов';
   } else if(MES.paused){
     cls='s-pause'; t='Пауза · вы отошли'; s='Звонки приостановлены'; bcls='b-resume'; blabel='Возобновить';
+  } else if(MES.on_call){
+    cls='s-call'; t='На звонке'; s='Идёт разговор — передышка начнётся после'; bcls='b-pause'; blabel='Пауза';
   } else if(MES.breather_seconds_left>0){
     cls='s-break'; t='Передышка · '+MES.breather_seconds_left+'с'; s='Следующий звонок — после паузы'; bcls='b-ready'; blabel='Готов раньше';
   } else {
@@ -370,7 +374,7 @@ async function pollMe(){
     const r=await fetch('/manager/api/me');
     if(!r.ok) return;
     const d=await r.json();
-    MES.online=!!d.online; MES.paused=!!d.paused;
+    MES.online=!!d.online; MES.paused=!!d.paused; MES.on_call=!!d.on_call;
     MES.ready=!!d.ready; MES.breather_seconds_left=d.breather_seconds_left||0;
     renderStrip();
   }catch(e){}

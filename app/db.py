@@ -50,12 +50,16 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE managers ADD COLUMN IF NOT EXISTS paused BOOLEAN DEFAULT FALSE"
             ))
+            await conn.execute(text(
+                "ALTER TABLE managers ADD COLUMN IF NOT EXISTS on_call BOOLEAN DEFAULT FALSE"
+            ))
         else:
             for col, typ in (
                 ("busy_until", "TIMESTAMP"),
                 ("login", "VARCHAR"),
                 ("password_hash", "VARCHAR"),
                 ("paused", "BOOLEAN DEFAULT 0"),
+                ("on_call", "BOOLEAN DEFAULT 0"),
             ):
                 try:
                     await conn.execute(text(
@@ -70,6 +74,10 @@ async def init_db() -> None:
         # заблокированными. Чистый старт = корректное состояние.
         try:
             await conn.execute(text("UPDATE managers SET busy_until = NULL"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("UPDATE managers SET on_call = FALSE"))
         except Exception:
             pass
         try:

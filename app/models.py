@@ -42,6 +42,11 @@ class Manager(Base):
     # не нажмёт «Возобновить». В отличие от busy_until (передышка на N секунд),
     # пауза не имеет таймера и держится до явного снятия.
     paused = Column(Boolean, default=False, nullable=False)
+    # Оператор ПРЯМО СЕЙЧАС на звонке (callback назначен / идёт разговор).
+    # Отличает «занят на звонке» от «передышка после звонка»: пока on_call=True,
+    # передышку НЕ показываем и отсчёт не идёт — он начнётся только когда звонок
+    # полностью завершится (on_call станет False).
+    on_call = Column(Boolean, default=False, nullable=False)
     missed = Column(Integer, default=0, nullable=False)
     accepted_calls = Column(Integer, default=0, nullable=False)
 
