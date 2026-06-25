@@ -600,6 +600,54 @@ async def clear_autodial_queue(_: None = Depends(require_auth)):
     return {"ok": True, "removed_from_queue": int(cnt), "closed_sessions": closed}
 
 
+@app.post("/admin/reset-stats")
+async def reset_dashboard_stats(_: None = Depends(require_auth)):
+    """Полный сброс статистики дашборда «с чистого листа».
+
+    Удаляет ВСЮ историю звонков (call_logs), все сессии (call_sessions) и
+    очередь (autodial_queue); обнуляет счётчики менеджеров (принято/пропущено,
+    приоритет) и снимает занятость/паузу/«на звонке». САМИХ менеджеров и их
+    логины НЕ трогает. После вызова дашборд показывает нули.
+    """
+    async with async_session_maker() as session:
+        logs = (await session.execute(
+            select(func.count()).select_from(CallLog)
+        )).scalar_one()
+        sessions_cnt = (await session.execute(
+            select(func.count()).select_from(CallSession)
+        )).scalar_one()
+        queue_cnt = (await session.execute(
+            select(func.count()).select_from(AutodialQueue)
+        )).scalar_one()
+
+        await session.execute(delete(CallLog))
+        await session.execute(delete(CallSession))
+        await session.execute(delete(AutodialQueue))
+
+        # Обнуляем счётчики менеджеров, оставляя их самих и их статус online.
+        managers = (await session.execute(select(Manager))).scalars().all()
+        for m in managers:
+            m.accepted_calls = 0
+            m.missed = 0
+            m.priority_score = 0.5
+            m.busy_until = None
+            m.on_call = False
+            m.paused = False
+        await session.commit()
+
+    logger.info(
+        "[reset-stats] сброшено: логов=%d, сессий=%d, очередь=%d, менеджеров=%d",
+        logs, sessions_cnt, queue_cnt, len(managers),
+    )
+    return {
+        "ok": True,
+        "deleted_logs": int(logs),
+        "deleted_sessions": int(sessions_cnt),
+        "cleared_queue": int(queue_cnt),
+        "reset_managers": len(managers),
+    }
+
+
 @app.post("/autodial/retry-now/{lead_id}")
 async def retry_now(lead_id: int, _: None = Depends(require_auth)):
     """«Дозвониться сейчас» — выдернуть лид из таймерного перезвона в очередь
