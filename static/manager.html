@@ -68,6 +68,9 @@
   .ready-strip.s-break  { background:rgba(251,191,36,0.12); border-color:rgba(251,191,36,0.38); }
   .ready-strip.s-pause  { background:rgba(248,113,113,0.12); border-color:rgba(248,113,113,0.38); }
   .ready-strip.s-call   { background:var(--blue-bg); border-color:rgba(79,143,247,0.40); }
+  .ready-strip.s-await  { background:rgba(251,191,36,0.14); border-color:rgba(251,191,36,0.45); }
+  .s-await .rs-dot { background:var(--amber); box-shadow:0 0 12px var(--amber); animation:rsPulse 1.2s infinite; }
+  .rs-buttons { display:flex; gap:8px; flex:none; }
   .ready-strip.s-off    { background:var(--field); border-color:var(--field-bd); }
   .rs-left { display:flex; align-items:center; gap:11px; min-width:0; }
   .rs-dot { width:11px; height:11px; border-radius:50%; flex:none; }
@@ -87,8 +90,9 @@
   .rs-btn.b-pause:hover { background:var(--surface); }
   .rs-btn.b-resume { background:var(--green); color:#04150e; }
   .rs-btn.b-resume:hover { filter:brightness(1.07); background:var(--green); }
-  .rs-btn.b-ready  { background:var(--amber); color:#231a02; }
-  .rs-btn.b-ready:hover { filter:brightness(1.07); background:var(--amber); }
+  .rs-btn.b-ready  { background:var(--green); color:#04150e; box-shadow:0 4px 14px rgba(52,211,153,0.32); }
+  .rs-btn.b-ready:hover { filter:brightness(1.07); background:var(--green); }
+  .rs-btn.b-ready-dim { background:var(--field); color:var(--text-dim); border:1px solid var(--field-bd); box-shadow:none; cursor:not-allowed; opacity:0.6; }
   /* Login */
   #login-view { max-width:380px; margin:9vh auto 0; }
   .login-card { padding:30px 28px; }
@@ -105,6 +109,23 @@
   }
   input:focus,select:focus,textarea:focus { outline:none; border-color:var(--accent); }
   textarea { min-height:76px; resize:vertical; }
+  /* Дропдаун стадий — крупный, читабельный, с явной стрелкой */
+  select#stage-select {
+    appearance:none; -webkit-appearance:none; -moz-appearance:none;
+    font-size:15px; font-weight:600; padding:14px 42px 14px 16px;
+    background:var(--field-bd);
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23eef1f7' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+    background-repeat:no-repeat; background-position:right 16px center;
+    border:1.5px solid var(--field-bd); border-radius:13px; cursor:pointer;
+  }
+  [data-theme="light"] select#stage-select {
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2316203a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  }
+  select#stage-select:hover { border-color:var(--accent); }
+  select#stage-select option {
+    background:var(--surface-solid); color:var(--text);
+    font-size:15px; font-weight:500; padding:10px;
+  }
   button {
     width:100%; margin-top:22px; padding:13px; font-size:15.5px; font-weight:600;
     border:none; border-radius:13px; background:var(--accent); color:#fff; cursor:pointer;
@@ -233,7 +254,10 @@
           <div class="rs-sub" id="rs-sub">Звонки приходят вам</div>
         </div>
       </div>
-      <button class="rs-btn b-pause" id="rs-btn" onclick="onReadyBtn()">Пауза</button>
+      <div class="rs-buttons">
+        <button class="rs-btn b-ready" id="rs-ready-btn" onclick="onReadyClick()">Готов принимать</button>
+        <button class="rs-btn b-pause" id="rs-pause-btn" onclick="onPauseClick()">Пауза</button>
+      </div>
     </div>
 
     <div class="glass topbar">
@@ -345,29 +369,38 @@ function playDing(){
 }
 
 /* ===== Полоса готовности / передышка / пауза ===== */
-let MES={online:true,paused:false,ready:true,breather_seconds_left:0,on_call:false};
-let ME_POLL=null, TICK=null, BUSY_BTN=false;
+let MES={online:true,paused:false,ready:true,on_call:false,awaiting_ready:false};
+let ME_POLL=null, BUSY_RB=false, BUSY_PB=false;
 function renderStrip(){
   const strip=document.getElementById('ready-strip');
   const title=document.getElementById('rs-title');
   const sub=document.getElementById('rs-sub');
-  const btn=document.getElementById('rs-btn');
+  const readyBtn=document.getElementById('rs-ready-btn');
+  const pauseBtn=document.getElementById('rs-pause-btn');
   if(!strip) return;
-  let cls,t,s,bcls,blabel;
+  // Состояние полосы (фон/точка/текст)
+  let cls,t,s;
   if(!MES.online){
-    cls='s-off'; t='Не на линии'; s='Звонки не приходят'; bcls='b-resume'; blabel='Готов';
+    cls='s-off'; t='Не на линии'; s='Нажмите «Готов принимать», чтобы выйти на линию';
   } else if(MES.paused){
-    cls='s-pause'; t='Пауза · вы отошли'; s='Звонки приостановлены'; bcls='b-resume'; blabel='Возобновить';
+    cls='s-pause'; t='Пауза · вы отошли'; s='Звонки приостановлены';
   } else if(MES.on_call){
-    cls='s-call'; t='На звонке'; s='Идёт разговор — передышка начнётся после'; bcls='b-pause'; blabel='Пауза';
-  } else if(MES.breather_seconds_left>0){
-    cls='s-break'; t='Передышка · '+MES.breather_seconds_left+'с'; s='Следующий звонок — после паузы'; bcls='b-ready'; blabel='Готов раньше';
+    cls='s-call'; t='На звонке'; s='Идёт разговор · заполняйте карточку';
+  } else if(MES.awaiting_ready){
+    cls='s-await'; t='Завершите карточку'; s='Нажмите «Готов принимать», когда дозаполните карточку';
   } else {
-    cls='s-ready'; t='Готов · принимаю звонки'; s='Звонки приходят вам'; bcls='b-pause'; blabel='Пауза';
+    cls='s-ready'; t='Готов · принимаю звонки'; s='Звонки приходят вам';
   }
   strip.className='ready-strip glass '+cls;
   title.textContent=t; sub.textContent=s;
-  btn.className='rs-btn '+bcls; btn.textContent=blabel;
+  // Кнопка «Готов принимать»: зелёная, активна когда есть что снимать
+  // (awaiting_ready / on_call / paused / offline) — иначе серая.
+  const needsReady = MES.awaiting_ready || MES.on_call || MES.paused || !MES.online;
+  readyBtn.className='rs-btn '+(needsReady?'b-ready':'b-ready-dim');
+  readyBtn.disabled=!needsReady;
+  // Кнопка «Пауза/Возобновить»
+  if(MES.paused){ pauseBtn.className='rs-btn b-resume'; pauseBtn.textContent='Возобновить'; }
+  else { pauseBtn.className='rs-btn b-pause'; pauseBtn.textContent='Пауза'; }
 }
 async function pollMe(){
   try{
@@ -375,34 +408,39 @@ async function pollMe(){
     if(!r.ok) return;
     const d=await r.json();
     MES.online=!!d.online; MES.paused=!!d.paused; MES.on_call=!!d.on_call;
-    MES.ready=!!d.ready; MES.breather_seconds_left=d.breather_seconds_left||0;
+    MES.awaiting_ready=!!d.awaiting_ready; MES.ready=!!d.ready;
     renderStrip();
   }catch(e){}
 }
-function tickStrip(){
-  // локальный отсчёт передышки между опросами /me
-  if(!MES.paused && MES.online && MES.breather_seconds_left>0){
-    MES.breather_seconds_left-=1; renderStrip();
-  }
-}
-async function onReadyBtn(){
-  if(BUSY_BTN) return; BUSY_BTN=true;
-  const btn=document.getElementById('rs-btn'); btn.disabled=true;
+async function onReadyClick(){
+  if(BUSY_RB) return; BUSY_RB=true;
+  const b=document.getElementById('rs-ready-btn'); b.disabled=true;
   unlockAudio();
-  let url;
-  if(!MES.online || MES.paused) url='/manager/api/resume';
-  else if(MES.breather_seconds_left>0) url='/manager/api/ready-now';
-  else url='/manager/api/pause';
+  try{
+    const r=await fetch('/manager/api/ready-now',{method:'POST'});
+    if(r.ok){
+      MES.awaiting_ready=false; MES.on_call=false;
+      toast('Готов — звонки идут вам'); renderStrip();
+      hideCall();
+    }
+    else toast('Ошибка',true);
+  }catch(e){ toast('Ошибка соединения',true); }
+  finally{ BUSY_RB=false; pollMe(); }
+}
+async function onPauseClick(){
+  if(BUSY_PB) return; BUSY_PB=true;
+  const b=document.getElementById('rs-pause-btn'); b.disabled=true;
+  unlockAudio();
+  const url=MES.paused?'/manager/api/resume':'/manager/api/pause';
   try{
     const r=await fetch(url,{method:'POST'});
     if(r.ok){
       if(url.endsWith('/pause')){ MES.paused=true; toast('Пауза — звонки не приходят'); }
-      else if(url.endsWith('/resume')){ MES.paused=false; MES.online=true; MES.breather_seconds_left=0; toast('Возобновлено — вы готовы'); }
-      else { MES.breather_seconds_left=0; toast('Готов — звонки идут вам'); }
+      else { MES.paused=false; toast('Пауза снята'); }
       renderStrip();
     } else toast('Ошибка',true);
   }catch(e){ toast('Ошибка соединения',true); }
-  finally{ btn.disabled=false; BUSY_BTN=false; pollMe(); }
+  finally{ b.disabled=false; BUSY_PB=false; pollMe(); }
 }
 
 async function doLogin(){
@@ -418,7 +456,7 @@ async function doLogin(){
 }
 async function doLogout(){
   try{await fetch('/manager/api/logout',{method:'POST'});}catch(e){}
-  if(POLL)clearInterval(POLL); if(ME_POLL)clearInterval(ME_POLL); if(TICK)clearInterval(TICK);
+  if(POLL)clearInterval(POLL); if(ME_POLL)clearInterval(ME_POLL);
   ME=null;CURRENT_LEAD=null;
   document.getElementById('work-view').style.display='none';
   document.getElementById('login-view').style.display='block';
@@ -445,15 +483,18 @@ function switchTab(tab){
 function startPolling(){
   if(POLL)clearInterval(POLL); pollCall(); POLL=setInterval(pollCall,2000);
   if(ME_POLL)clearInterval(ME_POLL); pollMe(); ME_POLL=setInterval(pollMe,3000);
-  if(TICK)clearInterval(TICK); TICK=setInterval(tickStrip,1000);
 }
 async function pollCall(){
   try{
     const r=await fetch('/manager/api/current-call');
     if(r.status===401){doLogout();return;}
     const data=await r.json();
-    if(data&&data.wrap_up)showCall(data,true);
-    else if(data&&data.lead_id)showCall(data,false);
+    if(data&&data.lead_id) showCall(data,false);
+    else if(MES.awaiting_ready && CURRENT_LEAD){
+      // Звонок закончился, но оператор ещё не нажал «Готов» — карточку
+      // последнего лида ОСТАВЛЯЕМ на экране (он дозаполняет). Уйдёт после
+      // нажатия «Готов принимать».
+    }
     else hideCall();
   }catch(e){}
 }

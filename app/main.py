@@ -195,12 +195,15 @@ class ManagerUpdate(BaseModel):
 def _mgr_dict(m: Manager) -> dict:
     paused = bool(getattr(m, "paused", False))
     on_call = bool(getattr(m, "on_call", False))
+    awaiting_ready = bool(getattr(m, "awaiting_ready", False))
     if not m.online:
         status = "НЕ АКТИВЕН"
     elif on_call:
         status = "НА ЗВОНКЕ"
     elif paused:
         status = "ПАУЗА"
+    elif awaiting_ready:
+        status = "ЖДЁТ ГОТОВ"
     else:
         status = "НА ЛИНИИ"
     return {
@@ -210,6 +213,7 @@ def _mgr_dict(m: Manager) -> dict:
         "online": bool(m.online),
         "paused": paused,
         "on_call": on_call,
+        "awaiting_ready": awaiting_ready,
         "missed": int(m.missed or 0),
         "accepted_calls": int(m.accepted_calls or 0),
         "priority_score": round(float(m.priority_score or 0.5), 3),
@@ -283,6 +287,7 @@ async def set_manager_online(manager_id: int, _: None = Depends(require_auth)):
         mgr.paused = False
         mgr.busy_until = None
         mgr.on_call = False
+        mgr.awaiting_ready = False
         await session.commit()
         await session.refresh(mgr)
     return _mgr_dict(mgr)
@@ -600,54 +605,6 @@ async def clear_autodial_queue(_: None = Depends(require_auth)):
     return {"ok": True, "removed_from_queue": int(cnt), "closed_sessions": closed}
 
 
-@app.post("/admin/reset-stats")
-async def reset_dashboard_stats(_: None = Depends(require_auth)):
-    """Полный сброс статистики дашборда «с чистого листа».
-
-    Удаляет ВСЮ историю звонков (call_logs), все сессии (call_sessions) и
-    очередь (autodial_queue); обнуляет счётчики менеджеров (принято/пропущено,
-    приоритет) и снимает занятость/паузу/«на звонке». САМИХ менеджеров и их
-    логины НЕ трогает. После вызова дашборд показывает нули.
-    """
-    async with async_session_maker() as session:
-        logs = (await session.execute(
-            select(func.count()).select_from(CallLog)
-        )).scalar_one()
-        sessions_cnt = (await session.execute(
-            select(func.count()).select_from(CallSession)
-        )).scalar_one()
-        queue_cnt = (await session.execute(
-            select(func.count()).select_from(AutodialQueue)
-        )).scalar_one()
-
-        await session.execute(delete(CallLog))
-        await session.execute(delete(CallSession))
-        await session.execute(delete(AutodialQueue))
-
-        # Обнуляем счётчики менеджеров, оставляя их самих и их статус online.
-        managers = (await session.execute(select(Manager))).scalars().all()
-        for m in managers:
-            m.accepted_calls = 0
-            m.missed = 0
-            m.priority_score = 0.5
-            m.busy_until = None
-            m.on_call = False
-            m.paused = False
-        await session.commit()
-
-    logger.info(
-        "[reset-stats] сброшено: логов=%d, сессий=%d, очередь=%d, менеджеров=%d",
-        logs, sessions_cnt, queue_cnt, len(managers),
-    )
-    return {
-        "ok": True,
-        "deleted_logs": int(logs),
-        "deleted_sessions": int(sessions_cnt),
-        "cleared_queue": int(queue_cnt),
-        "reset_managers": len(managers),
-    }
-
-
 @app.post("/autodial/retry-now/{lead_id}")
 async def retry_now(lead_id: int, _: None = Depends(require_auth)):
     """«Дозвониться сейчас» — выдернуть лид из таймерного перезвона в очередь
@@ -713,6 +670,7 @@ async def all_managers_online(_: None = Depends(require_auth)):
             m.paused = False
             m.busy_until = None
             m.on_call = False
+            m.awaiting_ready = False
         await session.commit()
     logger.info("[bulk] все на линии (изменено %d из %d)", changed, len(rows))
     return {"ok": True, "set_online": changed, "total": len(rows)}
@@ -1220,22 +1178,18 @@ class PortalLogin(BaseModel):
 
 
 def _mgr_public(m: Manager) -> dict:
-    now = datetime.utcnow()
     paused = bool(getattr(m, "paused", False))
     on_call = bool(getattr(m, "on_call", False))
-    # Передышку считаем ТОЛЬКО когда оператор не на звонке. Пока on_call=True,
-    # busy_until — это страховка времени разговора (до 180с), а не передышка,
-    # поэтому отсчёт передышки не показываем.
-    breather_left = 0
-    if not on_call and m.busy_until and m.busy_until > now:
-        breather_left = int((m.busy_until - now).total_seconds())
+    awaiting_ready = bool(getattr(m, "awaiting_ready", False))
     return {"id": m.id, "name": m.name, "sipnumber": m.sipnumber,
             "online": bool(m.online),
             "paused": paused,
             "on_call": on_call,
-            "breather_seconds_left": breather_left,
-            # «готов» = на линии, не на паузе, не на звонке и не в передышке
-            "ready": bool(m.online) and not paused and not on_call and breather_left == 0}
+            "awaiting_ready": awaiting_ready,
+            # «готов» = на линии, не на паузе, не ждём «Готов»
+            # (on_call здесь НЕ блокирует ready, чтобы кнопка работала и во
+            # время разговора — оператор может заранее нажать «Готов»).
+            "ready": bool(m.online) and not paused and not awaiting_ready}
 
 
 @app.post("/manager/api/login", include_in_schema=False)
@@ -1278,8 +1232,9 @@ async def portal_current_call(mgr_session: Optional[str] = Cookie(default=None))
 
 @app.post("/manager/api/ready-now", include_in_schema=False)
 async def portal_ready_now(mgr_session: Optional[str] = Cookie(default=None)):
-    """«Готов принимать» — закончить передышку раньше: снять busy_until, чтобы
-    автодозвон мог сразу прислать следующий звонок. Паузу НЕ трогает."""
+    """«Готов принимать звонки» — оператор закончил заполнять карточку и готов
+    к следующему. Снимает флаг ожидания, on_call и страховку busy_until.
+    Паузу НЕ трогает (если на паузе — останется на паузе)."""
     mgr = await portal.get_session_manager(mgr_session)
     if not mgr:
         raise HTTPException(status_code=401, detail="no session")
@@ -1287,9 +1242,11 @@ async def portal_ready_now(mgr_session: Optional[str] = Cookie(default=None)):
         m = await session.get(Manager, mgr.id)
         if m:
             m.busy_until = None
+            m.on_call = False
+            m.awaiting_ready = False
             await session.commit()
-    logger.info("[breather] оператор %s готов принимать (передышка снята)", mgr.name)
-    return {"ok": True, "ready": True, "breather_seconds_left": 0}
+    logger.info("[ready] оператор %s готов принимать звонки", mgr.name)
+    return {"ok": True, "ready": True, "awaiting_ready": False}
 
 
 @app.post("/manager/api/pause", include_in_schema=False)
@@ -1310,7 +1267,8 @@ async def portal_pause(mgr_session: Optional[str] = Cookie(default=None)):
 
 @app.post("/manager/api/resume", include_in_schema=False)
 async def portal_resume(mgr_session: Optional[str] = Cookie(default=None)):
-    """«Возобновить» — снять паузу И передышку: оператор сразу готов."""
+    """«Возобновить» — снять паузу. Если оператор ещё «ждёт Готов» после
+    предыдущего звонка — этот флаг останется (он отдельный)."""
     mgr = await portal.get_session_manager(mgr_session)
     if not mgr:
         raise HTTPException(status_code=401, detail="no session")
@@ -1318,11 +1276,9 @@ async def portal_resume(mgr_session: Optional[str] = Cookie(default=None)):
         m = await session.get(Manager, mgr.id)
         if m:
             m.paused = False
-            m.busy_until = None
-            m.on_call = False
             await session.commit()
-    logger.info("[pause] оператор %s возобновил приём", mgr.name)
-    return {"ok": True, "paused": False, "ready": True}
+    logger.info("[pause] оператор %s снял паузу", mgr.name)
+    return {"ok": True, "paused": False}
 
 
 @app.get("/manager/api/card/{lead_id}", include_in_schema=False)

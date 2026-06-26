@@ -157,14 +157,16 @@ async def _get_available_managers(exclude_manager_id: Optional[int] = None) -> L
             select(Manager).where(Manager.online.is_(True))
         )
         managers = list(result.scalars().all())
-    # Отсеиваем занятых: busy_until в будущем = ещё на звонке/в передышке.
-    # Отсеиваем «на звонке» (on_call) — даже если guard-таймер истёк на длинном
-    # разговоре, пока звонок не завершён, второй звонок оператору НЕ шлём.
+    # Отсеиваем занятых: busy_until в будущем = ещё на звонке.
+    # Отсеиваем «на звонке» (on_call) — пока звонок не завершён, второй ему НЕ шлём.
+    # Отсеиваем «ждём Готов» (awaiting_ready) — оператор после звонка дозаполняет
+    #   карточку; следующий звонок ему придёт только когда сам нажмёт «Готов».
     # Отсеиваем на ручной паузе (paused) — оператор «отошёл».
     free = [
         m for m in managers
         if (getattr(m, "busy_until", None) is None or m.busy_until <= now)
         and not getattr(m, "on_call", False)
+        and not getattr(m, "awaiting_ready", False)
         and not getattr(m, "paused", False)
         and (exclude_manager_id is None or m.id != exclude_manager_id)
     ]
@@ -202,13 +204,15 @@ async def _set_busy(manager_id: int, seconds: int, on_call: Optional[bool] = Non
 
 
 async def _release_after_cooldown(manager_id: int) -> None:
-    """Звонок завершён → стартует передышка (busy_until на _COOLDOWN_SECONDS),
-    on_call снимается (теперь это именно передышка, а не разговор)."""
+    """Звонок завершён. Передышки больше НЕТ — оператор переходит в режим
+    «ждём кнопку Готов»: автодозвон не шлёт ему звонки, пока он сам не нажмёт
+    «Готов принимать» на странице. Это даёт время дозаполнить карточку."""
     async with async_session_maker() as session:
         mgr = await session.get(Manager, manager_id)
         if mgr:
-            mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
+            mgr.busy_until = None
             mgr.on_call = False
+            mgr.awaiting_ready = True
             await session.commit()
 
 
@@ -237,12 +241,13 @@ async def mark_busy_from_sipuni(sipnumber: Optional[str], event_finished: bool) 
         if not mgr:
             return  # это не наш оператор — пропускаем
         if event_finished:
-            # звонок завершён → освобождаем через передышку, снимаем on_call
-            mgr.busy_until = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
+            # звонок завершён → оператор в режим «ждём кнопку Готов»
+            mgr.busy_until = None
             mgr.on_call = False
+            mgr.awaiting_ready = True
             logger.info(
-                "[busy] оператор %s (sip=%s) освободился после звонка (+%dс передышка)",
-                mgr.name, sip, _COOLDOWN_SECONDS,
+                "[busy] оператор %s (sip=%s) завершил звонок — ждём кнопку «Готов принимать»",
+                mgr.name, sip,
             )
         else:
             # звонок начался/идёт → занят и на звонке (страховка от залипания)
@@ -687,7 +692,16 @@ async def process_new_lead(
             await _mark_accepted(manager.id)
             await record_outcome(manager.id, success=True)
             # Подтверждаем «на звонке» (резерв уже стоял; обновляем guard).
-            await _set_busy(manager.id, _BUSY_GUARD_SECONDS, on_call=True)
+            # И сразу помечаем «ждём Готов»: даже если оператор повесит трубку
+            # без события завершения от Sipuni, ему всё равно не пойдёт второй
+            # звонок до нажатия «Готов принимать».
+            async with async_session_maker() as ms:
+                mgr_obj = await ms.get(Manager, manager.id)
+                if mgr_obj:
+                    mgr_obj.busy_until = datetime.utcnow() + timedelta(seconds=_BUSY_GUARD_SECONDS)
+                    mgr_obj.on_call = True
+                    mgr_obj.awaiting_ready = True
+                    await ms.commit()
 
             await _log_call(
                 lead_id=lead_id, phone=client_phone, call_type=call_type,

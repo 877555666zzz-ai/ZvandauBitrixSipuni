@@ -47,6 +47,11 @@ class Manager(Base):
     # передышку НЕ показываем и отсчёт не идёт — он начнётся только когда звонок
     # полностью завершится (on_call станет False).
     on_call = Column(Boolean, default=False, nullable=False)
+    # «Завершение карточки»: после приёма звонка оператор должен сам нажать
+    # «Готов принимать», только тогда ему пойдёт следующий звонок. Это даёт
+    # время дозаполнить карточку клиента в Bitrix и сменить стадию.
+    # Снимается только кнопкой «Готов принимать» (или админом из дашборда).
+    awaiting_ready = Column(Boolean, default=False, nullable=False)
     missed = Column(Integer, default=0, nullable=False)
     accepted_calls = Column(Integer, default=0, nullable=False)
 
