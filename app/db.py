@@ -72,6 +72,31 @@ async def init_db() -> None:
                 except Exception:
                     pass  # колонка уже есть
 
+        # Миграции под перевод звонка (адресный дозвон): колонки в очереди и
+        # сессиях. Postgres умеет IF NOT EXISTS; для SQLite — try/except.
+        if settings.DATABASE_URL.startswith("postgresql"):
+            await conn.execute(text(
+                "ALTER TABLE autodial_queue ADD COLUMN IF NOT EXISTS target_manager_id INTEGER"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS is_transfer BOOLEAN DEFAULT FALSE"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS target_manager_id INTEGER"
+            ))
+        else:
+            for table, col, typ in (
+                ("autodial_queue", "target_manager_id", "INTEGER"),
+                ("call_sessions", "is_transfer", "BOOLEAN DEFAULT 0"),
+                ("call_sessions", "target_manager_id", "INTEGER"),
+            ):
+                try:
+                    await conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {typ}"
+                    ))
+                except Exception:
+                    pass  # колонка уже есть
+
         # При старте сервиса сбрасываем «занятость» менеджеров и снимаем все
         # блокировки лидов: после рестарта старые звонки уже не активны, а
         # подвисшие busy_until/блокировки иначе держали бы менеджеров и лиды

@@ -9,6 +9,7 @@ score = ok / total  (диапазон 0..1, дефолт 0.5)
 """
 import logging
 import math
+import random
 from datetime import datetime
 from typing import List
 
@@ -59,15 +60,13 @@ async def record_outcome(manager_id: int, success: bool) -> None:
 
 def sort_managers(managers: List[Manager]) -> List[Manager]:
     """
-    Online сначала, потом меньше missed, больше accepted, выше score, ниже id.
+    Случайный выбор среди свободных: НЕ судим по рейтингу/принятым/пропускам.
+    Просто перемешиваем список — кому достанется звонок, решает случай.
+    Так нагрузка не липнет ни к «звезде», ни к «аутсайдеру».
+
+    На вход приходят уже отфильтрованные (online + свободные) менеджеры,
+    поэтому здесь остаётся только честно перетасовать их.
     """
-    return sorted(
-        managers,
-        key=lambda m: (
-            -int(bool(m.online)),
-            int(m.missed or 0),
-            -int(m.accepted_calls or 0),
-            -float(m.priority_score or 0.5),
-            m.id,
-        ),
-    )
+    shuffled = list(managers)
+    random.shuffle(shuffled)
+    return shuffled

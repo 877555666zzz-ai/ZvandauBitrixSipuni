@@ -83,6 +83,11 @@ class AutodialQueue(Base):
     lead_name = Column(String, nullable=True)
     lead_source = Column(String, nullable=True)
 
+    # Адресный дозвон (перевод звонка на конкретного оператора). Если задан —
+    # лид уходит ТОЛЬКО этому менеджеру: свободен → звоним сразу, занят → ждём
+    # именно его, на других НЕ раскидываем. NULL = обычный лид (любому свободному).
+    target_manager_id = Column(Integer, nullable=True)
+
     attempts = Column(Integer, default=0, nullable=False)
     next_call_time = Column(DateTime, nullable=False)
 
@@ -172,6 +177,12 @@ class CallSession(Base):
 
     is_autodial = Column(Boolean, default=False, nullable=False)
     attempts_used = Column(Integer, default=0, nullable=False)
+
+    # Перевод звонка на конкретного оператора. is_transfer=True + target_manager_id
+    # говорят вебхуку Sipuni: при недозвоне НЕ каскадить на других, а повторять
+    # к этому же оператору (перевод адресный).
+    is_transfer = Column(Boolean, default=False, nullable=False)
+    target_manager_id = Column(Integer, nullable=True)
 
     __table_args__ = (
         Index("ix_call_sessions_lead_state", "lead_id", "state"),

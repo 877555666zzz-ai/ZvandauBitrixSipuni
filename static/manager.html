@@ -301,6 +301,8 @@
             <button class="ghost" onclick="addTask()">Поставить задачу</button>
           </div>
           <button class="open-bx" onclick="openBitrix()">Открыть в Bitrix</button>
+          <button class="open-bx" id="transfer-btn" onclick="toggleTransfer()">↪ Перекинуть на коллегу</button>
+          <div id="transfer-box" style="display:none;margin-top:8px"></div>
           <button class="ready-btn" id="ready-btn" onclick="markReady()" style="display:none">✓ Готов(а) звонить</button>
           <div class="wrap-hint" id="wrap-hint" style="display:none">Заполните карточку и нажмите «Готов(а) звонить» — следующий звонок придёт только после этого.</div>
         </div>
@@ -535,6 +537,11 @@ async function showCall(call, wrapUp){
   document.getElementById('c-phone').textContent=call.phone||'';
   document.getElementById('c-name').textContent='Загрузка…';
   document.getElementById('c-fields').innerHTML='';
+  // Новый звонок → сбрасываем поля прошлого клиента, чтобы недописанный
+  // комментарий и выбранная стадия НЕ «прилипли» к новому лиду.
+  const _ct=document.getElementById('comment-text'); if(_ct)_ct.value='';
+  const _ss=document.getElementById('stage-select'); if(_ss)_ss.selectedIndex=0;
+  const _tb=document.getElementById('transfer-box'); if(_tb){_tb.style.display='none';_tb.innerHTML='';} TRANSFER_OPEN=false;
   try{
     const r=await fetch('/manager/api/card/'+call.lead_id); const c=await r.json();
     document.getElementById('c-name').textContent=c.name||c.title||'Клиент';
@@ -558,7 +565,7 @@ async function markReady(){
   }catch(e){toast('Ошибка соединения',true);}
   finally{ btn.disabled=false; }
 }
-function hideCall(){document.getElementById('call-card').style.display='none';document.getElementById('idle').style.display='block';LAST_LEAD=null;CURRENT_LEAD=null;}
+function hideCall(){document.getElementById('call-card').style.display='none';document.getElementById('idle').style.display='block';LAST_LEAD=null;CURRENT_LEAD=null;const _ct=document.getElementById('comment-text');if(_ct)_ct.value='';const _ss=document.getElementById('stage-select');if(_ss)_ss.selectedIndex=0;const _tb=document.getElementById('transfer-box');if(_tb){_tb.style.display='none';_tb.innerHTML='';}TRANSFER_OPEN=false;}
 
 async function loadLeads(){
   const box=document.getElementById('leads-list');
@@ -617,6 +624,48 @@ async function addTask(){
 function openBitrix(){
   if(!CURRENT_LEAD)return;
   fetch('/manager/api/card/'+CURRENT_LEAD).then(r=>r.json()).then(c=>{if(c.bitrix_url)window.open(c.bitrix_url,'_blank');else toast('Ссылка недоступна',true);});
+}
+
+// ── Перевод звонка на коллегу ──────────────────────────────
+let TRANSFER_OPEN=false;
+let COLLEAGUES=[];
+async function toggleTransfer(){
+  const box=document.getElementById('transfer-box');
+  TRANSFER_OPEN=!TRANSFER_OPEN;
+  if(!TRANSFER_OPEN){box.style.display='none';box.innerHTML='';return;}
+  box.style.display='block';
+  box.innerHTML='<div class="empty">Загрузка коллег…</div>';
+  try{
+    const r=await fetch('/manager/api/colleagues');
+    const list=await r.json();
+    COLLEAGUES=Array.isArray(list)?list:[];
+    if(!COLLEAGUES.length){box.innerHTML='<div class="empty">Нет коллег на линии</div>';return;}
+    box.innerHTML=COLLEAGUES.map(c=>{
+      const color=c.free?'#22c55e':'#f59e0b';
+      return `<div class="lead-item" style="cursor:pointer" onclick="doTransfer(${c.id})">
+        <div class="lead-l"><div class="nm">${escapeHtml(c.name)}</div><div class="ph">ext ${escapeHtml(c.sipnumber||'')}</div></div>
+        <div class="lead-r"><span class="pill" style="background:${color}22;color:${color}">${escapeHtml(c.status)}</span></div>
+      </div>`;
+    }).join('');
+  }catch(e){box.innerHTML='<div class="empty">Ошибка загрузки</div>';}
+}
+async function doTransfer(id){
+  const col=COLLEAGUES.find(c=>c.id===id);
+  const name=col?col.name:'коллегу';
+  if(!confirm('Перекинуть звонок на '+name+'?'))return;
+  try{
+    const r=await fetch('/manager/api/transfer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_manager_id:id})});
+    if(r.ok){
+      const res=await r.json();
+      toast(res.outcome==='calling'?('Переводим на '+name+' — звоним ему'):('Переведено: '+name+' примет, как освободится'));
+      TRANSFER_OPEN=false;
+      hideCall();
+    } else {
+      let msg='Не удалось перевести';
+      try{const e=await r.json();if(e.detail)msg=e.detail;}catch(_){}
+      toast(msg,true);
+    }
+  }catch(e){toast('Ошибка соединения',true);}
 }
 (async function(){try{const r=await fetch('/manager/api/me');if(r.ok){ME=await r.json();showWork();}}catch(e){}})();
 document.getElementById('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});

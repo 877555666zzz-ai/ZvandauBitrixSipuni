@@ -205,3 +205,43 @@ async def get_my_stats(manager_id: int) -> dict:
             "conversion": conv,
             "priority_score": round(float(mgr.priority_score or 0.5), 2),
         }
+
+# ── Коллеги для перевода звонка ──────────────────────────────
+def _colleague_is_free(m: Manager, now: datetime) -> bool:
+    """Свободен ли оператор для приёма перевода прямо сейчас."""
+    return (
+        bool(m.online)
+        and (getattr(m, "busy_until", None) is None or m.busy_until <= now)
+        and not getattr(m, "on_call", False)
+        and not getattr(m, "awaiting_ready", False)
+        and not getattr(m, "paused", False)
+    )
+
+
+async def get_colleagues(exclude_manager_id: int) -> list:
+    """Список ОНЛАЙН-коллег (кроме себя) для перевода звонка.
+
+    Оффлайн-операторов не показываем — перекинуть можно только на того, кто
+    на линии. У каждого — статус free/busy, чтобы оператор видел, уйдёт звонок
+    сразу или встанет в ожидание к этому коллеге.
+    """
+    now = datetime.utcnow()
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Manager)
+            .where(Manager.online.is_(True))
+            .where(Manager.id != exclude_manager_id)
+        )
+        managers = list(result.scalars().all())
+    managers.sort(key=lambda m: (m.name or "").lower())
+    out = []
+    for m in managers:
+        free = _colleague_is_free(m, now)
+        out.append({
+            "id": m.id,
+            "name": m.name,
+            "sipnumber": m.sipnumber,
+            "free": free,
+            "status": "Свободен" if free else "Занят",
+        })
+    return out

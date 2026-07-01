@@ -173,6 +173,25 @@ async def _get_available_managers(exclude_manager_id: Optional[int] = None) -> L
     return sort_managers(free)
 
 
+def _is_manager_free(m: Manager, now: Optional[datetime] = None) -> bool:
+    """Свободен ли конкретный оператор для нового звонка (те же условия, что и
+    в _get_available_managers, но для одного менеджера)."""
+    now = now or datetime.utcnow()
+    return (
+        bool(m.online)
+        and (getattr(m, "busy_until", None) is None or m.busy_until <= now)
+        and not getattr(m, "on_call", False)
+        and not getattr(m, "awaiting_ready", False)
+        and not getattr(m, "paused", False)
+    )
+
+
+async def _get_target_manager(manager_id: int) -> Optional[Manager]:
+    """Загрузить конкретного менеджера (для адресного дозвона/перевода)."""
+    async with async_session_maker() as session:
+        return await session.get(Manager, manager_id)
+
+
 # Сколько секунд менеджер «занят» после старта звонка (страховка от залипания).
 _BUSY_GUARD_SECONDS = 180
 # «Передышка» после завершения звонка перед новым — чтобы оператор успел
@@ -340,6 +359,7 @@ async def schedule_autodial(
     lead_name: Optional[str] = None,
     lead_source: Optional[str] = None,
     next_call_time: Optional[datetime] = None,
+    target_manager_id: Optional[int] = None,
 ) -> None:
     next_attempt = current_attempts + 1
 
@@ -398,6 +418,8 @@ async def schedule_autodial(
             item.lead_source = lead_source or item.lead_source
             item.next_call_time = next_call_time
             item.state = "SCHEDULED"
+            if target_manager_id is not None:
+                item.target_manager_id = target_manager_id
         else:
             session.add(
                 AutodialQueue(
@@ -405,6 +427,7 @@ async def schedule_autodial(
                     phone=phone,
                     lead_name=lead_name,
                     lead_source=lead_source,
+                    target_manager_id=target_manager_id,
                     attempts=next_attempt,
                     next_call_time=next_call_time,
                     state="SCHEDULED",
@@ -444,6 +467,7 @@ async def _enqueue_waiting(
     lead_name: Optional[str] = None,
     lead_source: Optional[str] = None,
     insert_if_missing: bool = True,
+    target_manager_id: Optional[int] = None,
 ) -> bool:
     now = datetime.utcnow()
     async with async_session_maker() as session:
@@ -458,6 +482,8 @@ async def _enqueue_waiting(
             item.lead_source = lead_source or item.lead_source
             item.next_call_time = now          # готов сразу
             item.state = "WAITING"
+            if target_manager_id is not None:
+                item.target_manager_id = target_manager_id
             # attempts НЕ трогаем — ожидание не списывает попытку дозвона
         elif insert_if_missing:
             session.add(
@@ -466,6 +492,7 @@ async def _enqueue_waiting(
                     phone=phone,
                     lead_name=lead_name,
                     lead_source=lead_source,
+                    target_manager_id=target_manager_id,
                     attempts=attempts,
                     next_call_time=now,
                     state="WAITING",
@@ -547,6 +574,8 @@ async def process_new_lead(
     is_autodial: bool = False,
     received_at: Optional[datetime] = None,
     from_queue: bool = False,
+    target_manager_id: Optional[int] = None,
+    is_transfer: bool = False,
 ) -> Dict:
     """
     received_at — когда webhook пришёл от Bitrix. Используется для метрики
@@ -556,13 +585,24 @@ async def process_new_lead(
     если свободного менеджера нет, мы НЕ создаём новую строку очереди заново,
     а лишь обновляем существующую. Если строки уже нет (лид отменили/очистили
     из дашборда), лид не воскрешаем — отмена/очистка побеждают воркер.
+
+    target_manager_id — адресный дозвон (перевод звонка): лид уходит ТОЛЬКО
+    этому оператору. Свободен → звоним сразу; занят → лид ждёт именно его;
+    на других НЕ раскидываем.
+
+    is_transfer=True — это перевод активного звонка. Обходит проверку «дубль
+    номера» и «рабочие часы» (клиент уже на линии, его нельзя отложить).
     """
+    # Перевод звонка приравниваем к автодозвону для служебных проверок
+    # (не пишем дубль-логи, не откладываем по рабочим часам).
+    skip_new_lead_checks = is_autodial or is_transfer
+
     if not await _acquire_lead(lead_id):
         logger.info("[dispatch] лид %d уже обрабатывается", lead_id)
         return {"ok": True, "status": "already_in_progress", "lead_id": lead_id}
 
-    # Защита от дублей по телефону (только для новых лидов, не для автодозвона).
-    if not is_autodial and await _phone_recently_handled(client_phone, lead_id):
+    # Защита от дублей по телефону (только для новых лидов, не для автодозвона/перевода).
+    if not skip_new_lead_checks and await _phone_recently_handled(client_phone, lead_id):
         logger.info(
             "[dispatch] лид %d: номер %s уже обрабатывается/звонили — дубль, пропуск",
             lead_id, client_phone,
@@ -572,7 +612,7 @@ async def process_new_lead(
 
     # Рабочее время: новые лиды вне окна 11:00–21:00 не звонят сразу,
     # а откладываются до открытия окна (звонок не разбудит клиента ночью).
-    if not is_autodial and not _within_working_hours():
+    if not skip_new_lead_checks and not _within_working_hours():
         next_open = _next_window_open_utc()
         logger.info(
             "[dispatch] лид %d: вне рабочего времени — отложен до %s UTC",
@@ -602,22 +642,39 @@ async def process_new_lead(
         # и не прислали ему два звонка. В замке только быстрый выбор+резерв;
         # сетевой вызов Sipuni делаем уже ВНЕ замка.
         async with _DISPATCH_LOCK:
-            managers = await _get_available_managers()
-            manager = managers[0] if managers else None
+            if target_manager_id is not None:
+                # Адресный дозвон (перевод): берём ТОЛЬКО целевого оператора.
+                tgt = await _get_target_manager(target_manager_id)
+                if tgt is not None and not bool(tgt.online):
+                    # Цель ушла с линии, пока лид ждал → не держим клиента в
+                    # вечном ожидании, передаём как обычный лид первому свободному.
+                    logger.info(
+                        "[dispatch] лид %d: цель перевода (id=%s) оффлайн → в общий пул",
+                        lead_id, target_manager_id,
+                    )
+                    target_manager_id = None
+                    managers = await _get_available_managers()
+                    manager = managers[0] if managers else None
+                else:
+                    # Свободен → резервируем; занят → manager=None (ждём ИМЕННО его).
+                    manager = tgt if (tgt and _is_manager_free(tgt)) else None
+            else:
+                managers = await _get_available_managers()
+                manager = managers[0] if managers else None
             if manager is not None:
                 await _set_busy(manager.id, _BUSY_GUARD_SECONDS, on_call=True)
 
         if manager is None:
             # Нет СВОБОДНОГО менеджера (все заняты/на звонке/на паузе/оффлайн).
-            # Лид встаёт в очередь ОЖИДАНИЯ (WAITING) и будет отдан первому же
-            # освободившемуся оператору (воркер проверяет очередь часто). Клиенту
-            # в этой ветке ещё НЕ звонили (звоним сначала менеджеру), поэтому
-            # держать лид в ожидании безопасно — клиента это не дёргает.
+            # Обычный лид ждёт первого освободившегося; перевод — ждёт ИМЕННО
+            # целевого оператора. Клиенту в этой ветке ещё НЕ звонили (звоним
+            # сначала менеджеру), поэтому держать лид в ожидании безопасно.
             first_time = await _enqueue_waiting(
                 lead_id, client_phone,
                 attempts=0,
                 lead_name=lead_name, lead_source=lead_source,
                 insert_if_missing=not from_queue,
+                target_manager_id=target_manager_id,
             )
             if first_time:
                 logger.warning(
@@ -680,6 +737,8 @@ async def process_new_lead(
                         state="CALLBACK_CREATED",
                         callback_at=callback_start,
                         is_autodial=is_autodial,
+                        is_transfer=is_transfer,
+                        target_manager_id=target_manager_id,
                         attempts_used=len(attempts),
                     )
                 )
@@ -747,6 +806,7 @@ async def process_new_lead(
             attempts=0,
             lead_name=lead_name, lead_source=lead_source,
             insert_if_missing=not from_queue,
+            target_manager_id=target_manager_id,
         )
         await update_lead_status(lead_id, "retry")
         await _log_call(
@@ -885,6 +945,34 @@ async def handle_sipuni_status(
             message="Sipuni: менеджер не ответил по факту",
         )
 
+        # ── ПЕРЕВОД: адресный лид НЕ каскадим на других ─────────────
+        # При переводе клиент закреплён за конкретным оператором. Если он не
+        # ответил — не раскидываем на коллег, а повторяем к нему же.
+        if getattr(s, "is_transfer", False) and s.target_manager_id is not None:
+            if s.connected_at is not None:
+                # взял трубку, но клиент не ответил → таймерный перезвон к нему же
+                await schedule_autodial(
+                    s.lead_id, s.phone, current_attempts=s.attempts_used,
+                    target_manager_id=s.target_manager_id,
+                )
+                await update_lead_status(s.lead_id, "retry")
+                await add_lead_comment(
+                    s.lead_id,
+                    f"Перевод на {s.manager_name}: клиент не ответил — повтор к нему же.",
+                )
+                return {"ok": True, "matched": True, "state": "TRANSFER_RETRY"}
+            # оператор не взял трубку → ждём, пока он освободится (не чужим)
+            await _enqueue_waiting(
+                s.lead_id, s.phone, attempts=s.attempts_used,
+                target_manager_id=s.target_manager_id,
+            )
+            await update_lead_status(s.lead_id, "retry")
+            await add_lead_comment(
+                s.lead_id,
+                f"Перевод на {s.manager_name}: не взял трубку — ждём, когда освободится.",
+            )
+            return {"ok": True, "matched": True, "state": "TRANSFER_WAITING"}
+
         # ── КАСКАД: пробуем СЛЕДУЮЩЕГО свободного оператора ──────────
         # Оператор не ответил → не сразу в очередь, а сначала пробуем
         # передать лида следующему свободному (А не ответил → Б → В).
@@ -956,8 +1044,92 @@ async def handle_sipuni_status(
 
 
 # ─────────────────────────────────────────────
-# Worker
+# Перевод активного звонка на другого оператора
 # ─────────────────────────────────────────────
+async def initiate_transfer(
+    requesting_manager_id: int,
+    target_manager_id: int,
+) -> Dict:
+    """
+    Перекинуть текущий звонок оператора requesting_manager_id на оператора
+    target_manager_id (перевод через дозвон).
+
+    Логика:
+      1. Находим активный звонок инициатора (его CallSession).
+      2. Проверяем цель: онлайн и не он сам.
+      3. Закрываем сессию инициатора (TRANSFERRED), отпускаем его в «дозаполнение».
+      4. Запускаем адресный дозвон клиента на целевого оператора:
+         свободен → звоним сразу; занят → лид ждёт именно его.
+    """
+    if requesting_manager_id == target_manager_id:
+        return {"ok": False, "error": "same_manager"}
+
+    # 1. Активная сессия инициатора (самая свежая)
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=180)
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(CallSession)
+            .where(CallSession.manager_id == requesting_manager_id)
+            .where(CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]))
+            .where(CallSession.started_at >= cutoff)
+            .order_by(CallSession.started_at.desc())
+        )
+        active = result.scalars().first()
+
+    if not active:
+        return {"ok": False, "error": "no_active_call"}
+
+    lead_id = active.lead_id
+    phone = active.phone
+
+    # 2. Цель: должна быть онлайн
+    target = await _get_target_manager(target_manager_id)
+    if not target:
+        return {"ok": False, "error": "target_not_found"}
+    if not bool(target.online):
+        return {"ok": False, "error": "target_offline"}
+
+    # 3. Закрываем сессию инициатора и отпускаем его (как после обычного звонка)
+    async with async_session_maker() as session:
+        s = await session.get(CallSession, active.id)
+        if s:
+            s.state = "TRANSFERRED"
+            await session.commit()
+    await _release_after_cooldown(requesting_manager_id)
+
+    await add_lead_comment(
+        lead_id,
+        f"Звонок переведён на оператора {target.name} (ext. {target.sipnumber}).",
+    )
+    logger.info(
+        "[transfer] лид %d: %s → %s (ext=%s)",
+        lead_id, requesting_manager_id, target.name, target.sipnumber,
+    )
+
+    # 4. Адресный дозвон на целевого оператора (обходит дубль/рабочие часы)
+    res = await process_new_lead(
+        lead_id, phone,
+        is_transfer=True,
+        target_manager_id=target_manager_id,
+        received_at=datetime.utcnow(),
+    )
+
+    status = res.get("status")
+    if status == "callback_created":
+        outcome = "calling"          # звоним цели прямо сейчас
+    elif status == "no_managers_available":
+        outcome = "queued"           # цель занята → ждёт её
+    else:
+        outcome = status or "unknown"
+
+    return {
+        "ok": True,
+        "lead_id": lead_id,
+        "target_manager_id": target_manager_id,
+        "target_name": target.name,
+        "outcome": outcome,
+    }
 # Heartbeat: воркер обновляет эту метку в начале каждой итерации цикла.
 # Дашборд по ней понимает, жив ли воркер (если метка свежая — жив).
 _worker_last_tick: Optional[datetime] = None
@@ -1015,6 +1187,7 @@ async def autodial_worker() -> None:
                 attempts = item.attempts
                 lead_name = item.lead_name
                 lead_source = item.lead_source
+                target_mgr = item.target_manager_id
                 try:
                     res = await process_new_lead(
                         lead_id, phone,
@@ -1022,6 +1195,8 @@ async def autodial_worker() -> None:
                         lead_source=lead_source,
                         is_autodial=True,
                         from_queue=True,
+                        target_manager_id=target_mgr,
+                        is_transfer=target_mgr is not None,
                     )
                     status = res.get("status")
                     if status == "callback_created":

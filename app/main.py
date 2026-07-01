@@ -49,6 +49,7 @@ from .db import async_session_maker, init_db
 from .dispatcher import (
     autodial_worker,
     handle_sipuni_status,
+    initiate_transfer,
     mark_busy_from_sipuni,
     normalize_phone,
     process_new_lead,
@@ -1068,101 +1069,6 @@ async def sipuni_status_webhook(
     )
 
 
-# ─── Manager personal page ──────────────────────────────────
-_MANAGER_PAGE = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8">
-<title>AutoCall · Менеджер</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#0f172a;color:#f1f5f9;padding:20px;min-height:100vh}
-  .card{max-width:480px;margin:40px auto;background:#1e293b;border-radius:16px;padding:28px;box-shadow:0 10px 30px rgba(0,0,0,.3)}
-  h1{font-size:22px;margin-bottom:4px}
-  .ext{color:#94a3b8;font-size:14px;margin-bottom:24px}
-  .status{padding:14px;border-radius:10px;text-align:center;font-weight:600;margin-bottom:20px;font-size:18px}
-  .online{background:#16a34a;color:#fff}
-  .offline{background:#475569;color:#cbd5e1}
-  .btn{display:block;width:100%;padding:16px;border:none;border-radius:10px;font-size:17px;font-weight:600;cursor:pointer;margin-bottom:10px}
-  .btn-on{background:#22c55e;color:#fff}
-  .btn-off{background:#ef4444;color:#fff}
-  .btn:active{transform:scale(.98)}
-  .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:22px}
-  .stat{background:#0f172a;padding:14px;border-radius:8px;text-align:center}
-  .stat-val{font-size:24px;font-weight:700}
-  .stat-lbl{font-size:12px;color:#94a3b8;margin-top:4px}
-  .err{background:#7f1d1d;color:#fecaca;padding:12px;border-radius:8px;margin-top:14px;font-size:14px;display:none}
-  .recent{margin-top:24px}
-  .recent h3{font-size:14px;color:#94a3b8;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
-  .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #334155;font-size:13px}
-  .row:last-child{border-bottom:none}
-  .row .ph{color:#cbd5e1}
-  .row .st{color:#94a3b8}
-  .row .st.connected,.row .st.callback_created{color:#4ade80}
-  .row .st.no_answer{color:#fbbf24}
-  .row .st.no_managers,.row .st.failed{color:#f87171}
-</style></head>
-<body>
-<div class="card">
-  <h1 id="name">…</h1>
-  <div class="ext" id="ext">ext —</div>
-  <div class="status" id="status">…</div>
-  <button class="btn btn-on" id="onBtn">НА ЛИНИИ</button>
-  <button class="btn btn-off" id="offBtn">СНЯТЬ С ЛИНИИ</button>
-  <div class="err" id="err"></div>
-  <div class="stats">
-    <div class="stat"><div class="stat-val" id="cAccepted">—</div><div class="stat-lbl">Принято всего</div></div>
-    <div class="stat"><div class="stat-val" id="cMissed">—</div><div class="stat-lbl">Пропусков подряд</div></div>
-    <div class="stat"><div class="stat-val" id="cWeek">—</div><div class="stat-lbl">Звонков за 7 дней</div></div>
-    <div class="stat"><div class="stat-val" id="cConn">—</div><div class="stat-lbl">Соединено за 7 дней</div></div>
-  </div>
-  <div class="recent">
-    <h3>Последние звонки</h3>
-    <div id="recent"></div>
-  </div>
-</div>
-<script>
-const url=new URL(location.href);
-const id=url.pathname.split('/').pop();
-const tok=url.searchParams.get('token')||'';
-const hdr=tok?{'X-Manager-Token':tok}:{};
-const q=tok?'?token='+encodeURIComponent(tok):'';
-
-async function api(path, opts={}){
-  const r=await fetch(path+q,{...opts,headers:{...hdr,'Content-Type':'application/json',...(opts.headers||{})}});
-  if(!r.ok){throw new Error('HTTP '+r.status)}
-  return r.json();
-}
-function showErr(m){const e=document.getElementById('err');e.textContent=m;e.style.display='block';setTimeout(()=>e.style.display='none',3000)}
-
-async function refresh(){
-  try{
-    const s=await api('/managers/'+id+'/stats?days=7');
-    const m=s.manager;
-    document.getElementById('name').textContent=m.name;
-    document.getElementById('ext').textContent='ext '+m.sipnumber;
-    const st=document.getElementById('status');
-    if(m.online){st.textContent='НА ЛИНИИ';st.className='status online'}
-    else{st.textContent='НЕ АКТИВЕН';st.className='status offline'}
-    document.getElementById('cAccepted').textContent=m.accepted_calls;
-    document.getElementById('cMissed').textContent=m.missed;
-    document.getElementById('cWeek').textContent=s.calls_total;
-    document.getElementById('cConn').textContent=s.calls_connected;
-    const r=document.getElementById('recent');
-    r.innerHTML=s.recent_calls.slice(0,10).map(c=>{
-      const t=c.timestamp?new Date(c.timestamp).toLocaleString('ru'):'';
-      const name=c.lead_name||c.phone||('#'+c.lead_id);
-      return `<div class="row"><span class="ph">${t} · ${name}</span><span class="st ${c.status}">${c.status}</span></div>`;
-    }).join('')||'<div class="row"><span class="ph">пока нет звонков</span></div>';
-  }catch(e){showErr('Ошибка: '+e.message)}
-}
-document.getElementById('onBtn').onclick=async()=>{try{await api('/managers/'+id+'/online',{method:'POST'});refresh()}catch(e){showErr(e.message)}};
-document.getElementById('offBtn').onclick=async()=>{try{await api('/managers/'+id+'/offline',{method:'POST'});refresh()}catch(e){showErr(e.message)}};
-refresh();
-setInterval(refresh,15000);
-</script>
-</body></html>"""
-
-
 @app.get("/manager", response_class=HTMLResponse, include_in_schema=False)
 async def manager_portal_page():
     """Единая страница портала: вход → рабочий экран."""
@@ -1228,6 +1134,40 @@ async def portal_current_call(mgr_session: Optional[str] = Cookie(default=None))
         raise HTTPException(status_code=401, detail="no session")
     call = await portal.get_current_call(mgr.id)
     return call or {}
+
+
+@app.get("/manager/api/colleagues", include_in_schema=False)
+async def portal_colleagues(mgr_session: Optional[str] = Cookie(default=None)):
+    """Онлайн-коллеги (кроме себя) для перевода звонка — со статусом free/busy."""
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    return await portal.get_colleagues(mgr.id)
+
+
+class PortalTransfer(BaseModel):
+    target_manager_id: int
+
+
+@app.post("/manager/api/transfer", include_in_schema=False)
+async def portal_transfer(data: PortalTransfer,
+                          mgr_session: Optional[str] = Cookie(default=None)):
+    """Перекинуть текущий звонок оператора на выбранного онлайн-коллегу."""
+    mgr = await portal.get_session_manager(mgr_session)
+    if not mgr:
+        raise HTTPException(status_code=401, detail="no session")
+    res = await initiate_transfer(mgr.id, data.target_manager_id)
+    if not res.get("ok"):
+        # Понятные сообщения об ошибке для интерфейса
+        err = res.get("error")
+        msg = {
+            "same_manager": "Нельзя перевести самому себе",
+            "no_active_call": "Нет активного звонка для перевода",
+            "target_not_found": "Оператор не найден",
+            "target_offline": "Оператор не на линии",
+        }.get(err, "Не удалось перевести звонок")
+        raise HTTPException(status_code=400, detail=msg)
+    return res
 
 
 @app.post("/manager/api/ready-now", include_in_schema=False)
@@ -1354,77 +1294,6 @@ async def portal_action_task(data: PortalTask,
         raise HTTPException(status_code=401, detail="no session")
     res = await add_deal_task(data.lead_id, data.title)
     return {"ok": res is not None}
-
-
-@app.get("/manager/{manager_id}", response_class=HTMLResponse, include_in_schema=False)
-async def manager_page(manager_id: int, request: Request):
-    """
-    Личная страница менеджера. Доступ:
-      - если MANAGER_PAGE_TOKEN задан → нужен ?token=<TOKEN>
-      - иначе открыта всем (для dev)
-    """
-    if settings.MANAGER_PAGE_TOKEN:
-        token = (
-            request.query_params.get("token")
-            or request.headers.get("X-Manager-Token")
-            or ""
-        )
-        if not secrets.compare_digest(token, settings.MANAGER_PAGE_TOKEN):
-            return HTMLResponse(
-                "<h1>403</h1><p>Нужен правильный ?token=...</p>",
-                status_code=403,
-            )
-
-    async with async_session_maker() as session:
-        mgr = await session.get(Manager, manager_id)
-        if not mgr:
-            return HTMLResponse("<h1>404</h1><p>Менеджер не найден</p>", status_code=404)
-
-    return HTMLResponse(_MANAGER_PAGE)
-
-
-# ─── Manager page API (без HTTP Basic, но с MANAGER_PAGE_TOKEN) ──
-# Личная страница менеджера должна работать на телефонах без вводов
-# логина-пароля. Поэтому она ходит в API через тот же token, что и страница.
-# При установленном DASHBOARD_USER/PASSWORD основные /managers/... требуют
-# Basic, но мы добавляем «обход» через X-Manager-Token / ?token=
-def _manager_token_ok(request: Request) -> bool:
-    if not settings.MANAGER_PAGE_TOKEN:
-        return False
-    tok = (
-        request.query_params.get("token")
-        or request.headers.get("X-Manager-Token")
-        or ""
-    )
-    return bool(tok) and secrets.compare_digest(tok, settings.MANAGER_PAGE_TOKEN)
-
-
-# Переопределяем зависимость через middleware-style hook: если Basic-auth
-# отказала, но прошёл manager token — пускаем дальше для GET stats и POST online/offline.
-@app.middleware("http")
-async def manager_token_bypass(request: Request, call_next):
-    """
-    Если включён HTTP Basic и пришёл X-Manager-Token / ?token=, пускаем
-    запросы к /managers/{id}/stats|online|offline без Basic-auth.
-    """
-    path = request.url.path
-    if (
-        settings.auth_enabled
-        and settings.MANAGER_PAGE_TOKEN
-        and _manager_token_ok(request)
-        and path.startswith("/managers/")
-        and any(path.endswith(s) for s in ("/stats", "/online", "/offline"))
-    ):
-        # Подделываем Authorization header корректным значением, чтобы
-        # require_auth его пропустила.
-        import base64
-        cred = f"{settings.DASHBOARD_USER}:{settings.DASHBOARD_PASSWORD}".encode()
-        token = base64.b64encode(cred).decode()
-        new_headers = list(request.scope["headers"])
-        new_headers = [h for h in new_headers if h[0] != b"authorization"]
-        new_headers.append((b"authorization", f"Basic {token}".encode()))
-        request.scope["headers"] = new_headers
-    return await call_next(request)
 
 
 # ─── Test endpoints ─────────────────────────────────────────
