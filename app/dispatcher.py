@@ -360,6 +360,7 @@ async def schedule_autodial(
     lead_source: Optional[str] = None,
     next_call_time: Optional[datetime] = None,
     target_manager_id: Optional[int] = None,
+    last_manager_sipnumber: Optional[str] = None,
 ) -> None:
     next_attempt = current_attempts + 1
 
@@ -389,6 +390,10 @@ async def schedule_autodial(
         await update_lead_status(lead_id, "failed")
         # Все попытки исчерпаны, лид так и не ответил → стадия НДЗ 2
         await update_deal_stage(lead_id, settings.BITRIX_STAGE_NDZ2)
+        # Вешаем ответственным последнего оператора, к которому шла попытка
+        # (клиент не ответил, но лид должен остаться закреплён за оператором).
+        if last_manager_sipnumber:
+            await assign_deal_responsible(lead_id, last_manager_sipnumber)
         await add_lead_comment(
             lead_id,
             f"Автодозвон: не удалось связаться после "
@@ -973,43 +978,44 @@ async def handle_sipuni_status(
             )
             return {"ok": True, "matched": True, "state": "TRANSFER_WAITING"}
 
-        # ── КАСКАД: пробуем СЛЕДУЮЩЕГО свободного оператора ──────────
-        # Оператор не ответил → не сразу в очередь, а сначала пробуем
-        # передать лида следующему свободному (А не ответил → Б → В).
-        # В очередь на повтор откладываем ТОЛЬКО если свободных больше нет.
-        next_free = await _get_available_managers(exclude_manager_id=s.manager_id)
-        if next_free:
-            logger.info(
-                "[sipuni-webhook] лид %d: %s не ответил → каскад к следующему (%s)",
-                s.lead_id, s.manager_name, next_free[0].name,
-            )
-            await add_lead_comment(
-                s.lead_id,
-                f"Менеджер {s.manager_name} не ответил — передаём следующему "
-                f"свободному оператору.",
-            )
-            # Повторный запуск распределения: переберёт оставшихся свободных.
-            # attempts_used сохраняем — это та же попытка дозвона, не новая.
-            await process_new_lead(
-                s.lead_id, s.phone,
-                lead_name=None, lead_source=None,
-                is_autodial=True,  # не пишем дубль в working-hours/duplicate
-                received_at=datetime.utcnow(),
-            )
-            return {"ok": True, "matched": True, "state": "NO_ANSWER_CASCADED"}
-
-        # Свободных операторов больше нет. Различаем причину недозвона:
-        #
-        #  • Менеджер ТАК И НЕ ВЗЯЛ ТРУБКУ (нет event=3 → connected_at пуст).
-        #    Клиента при этом вообще НЕ набирали (звоним сначала менеджеру).
-        #    Это проблема доступности менеджера → в очередь ОЖИДАНИЯ, дозвонимся
-        #    как только освободится оператор (НЕ таймерный перезвон).
-        #
-        #  • Менеджер ОТВЕТИЛ (event=3 был → connected_at заполнен), а клиент
-        #    не ответил → реальный недозвон ДО КЛИЕНТА → таймерный перезвон
-        #    (+5/15/30) и стадия НДЗ.
+        # Различаем причину недозвона ДО каскада:
+        #   • connected_at пусто  → МЕНЕДЖЕР не взял трубку (клиента не набирали).
+        #   • connected_at задано → менеджер взял, но КЛИЕНТ не ответил.
         manager_answered = s.connected_at is not None
 
+        # ── КАСКАД (только если НЕ ВЗЯЛ ТРУБКУ МЕНЕДЖЕР) ─────────────
+        # Менеджер не поднял → сразу пробуем следующего свободного (А→Б→В),
+        # без пауз — это вопрос доступности оператора, клиента ещё не беспокоили.
+        # ВАЖНО: если менеджер ВЗЯЛ, а клиент не ответил — это реальный недозвон
+        # до клиента, его НЕЛЬЗЯ каскадить (иначе клиента дёргают подряд без пауз).
+        # Такой случай уходит ниже на таймерный перезвон (+5/15/30).
+        if not manager_answered:
+            next_free = await _get_available_managers(exclude_manager_id=s.manager_id)
+            if next_free:
+                logger.info(
+                    "[sipuni-webhook] лид %d: %s не взял трубку → каскад к следующему (%s)",
+                    s.lead_id, s.manager_name, next_free[0].name,
+                )
+                await add_lead_comment(
+                    s.lead_id,
+                    f"Менеджер {s.manager_name} не взял трубку — передаём следующему "
+                    f"свободному оператору.",
+                )
+                # Повторный запуск распределения: переберёт оставшихся свободных.
+                # attempts_used сохраняем — это та же попытка дозвона, не новая.
+                await process_new_lead(
+                    s.lead_id, s.phone,
+                    lead_name=None, lead_source=None,
+                    is_autodial=True,  # не пишем дубль в working-hours/duplicate
+                    received_at=datetime.utcnow(),
+                )
+                return {"ok": True, "matched": True, "state": "NO_ANSWER_CASCADED"}
+
+        # Дошли сюда — значит недозвон не удалось каскадить.
+        #  • manager_answered=True  → менеджер брал, КЛИЕНТ не ответил →
+        #    таймерный перезвон (+5/15/30) и стадия НДЗ.
+        #  • manager_answered=False → менеджер не взял и свободных больше нет →
+        #    очередь ОЖИДАНИЯ (дозвонимся, как только освободится оператор).
         if manager_answered:
             logger.info(
                 "[sipuni-webhook] лид %d: менеджер ответил, клиент не ответил → "
@@ -1017,6 +1023,7 @@ async def handle_sipuni_status(
             )
             await schedule_autodial(
                 s.lead_id, s.phone, current_attempts=s.attempts_used,
+                last_manager_sipnumber=s.manager_sipnumber,
             )
             await update_lead_status(s.lead_id, "retry")
             await update_deal_stage(s.lead_id, settings.BITRIX_STAGE_NDZ)

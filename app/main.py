@@ -863,8 +863,8 @@ async def bitrix_deal_webhook(
     _: None = Depends(_check_bitrix_secret),
 ):
     """
-    Принимает новые сделки из воронки «Яндекс 360» (category=12).
-    Триггер: сделка создана или попала в стадию «Тёплые лиды» (C12:NEW).
+    Принимает новые сделки из целевой воронки (BITRIX_DEAL_CATEGORY_ID).
+    Триггер: сделка создана в триггерной стадии (BITRIX_STAGE_TRIGGER).
     Стадии НЕ двигаем — только звоним и пишем комментарии.
     """
     received_at = datetime.utcnow()
@@ -910,21 +910,21 @@ async def bitrix_deal_webhook(
 
         result = deal.get("result") or {}
 
-        # Фильтр: только воронка Яндекс 360 (category_id=12)
+        # Фильтр: только целевая воронка (из настроек, по умолчанию Я360=12)
         category_id = str(result.get("CATEGORY_ID") or "")
-        if category_id != "12":
+        if category_id != str(settings.BITRIX_DEAL_CATEGORY_ID):
             logger.info(
-                "[webhook-deal] сделка #%d: category=%s, не наша воронка — игнор",
-                d_id, category_id,
+                "[webhook-deal] сделка #%d: category=%s, не наша воронка (%s) — игнор",
+                d_id, category_id, settings.BITRIX_DEAL_CATEGORY_ID,
             )
             return
 
-        # Фильтр: только стадия «Тёплые лиды»
+        # Фильтр: только триггерная стадия (из настроек)
         stage = result.get("STAGE_ID") or ""
-        if stage != "C12:NEW":
+        if stage != settings.BITRIX_STAGE_TRIGGER:
             logger.info(
-                "[webhook-deal] сделка #%d: стадия=%s, не C12:NEW — игнор",
-                d_id, stage,
+                "[webhook-deal] сделка #%d: стадия=%s, не триггер (%s) — игнор",
+                d_id, stage, settings.BITRIX_STAGE_TRIGGER,
             )
             return
 

@@ -67,9 +67,19 @@ class Settings(BaseSettings):
     # по URL вида /manager/{id}?token=...  если задан MANAGER_PAGE_TOKEN.
     MANAGER_PAGE_TOKEN: Optional[str] = None
 
-    # ── Стадии воронки «Яндекс 360» (category 12) ────────────
-    # Недозвоны кидаем в НДЗ; после исчерпания всех попыток — в НДЗ 2.
-    BITRIX_STAGE_NDZ: str = "C12:PREPARATION"        # НДЗ
+    # ── Воронка сделок и её стадии ───────────────────────────
+    # Всё вынесено в env, чтобы переключать воронку без правки кода.
+    # Дефолты = «Яндекс 360» (category 12), чтобы деплой нового кода НЕ
+    # переключал воронку сам — переключение делается заданием env-переменных.
+    #
+    # Переход на «Продажи» (category 0):
+    #   BITRIX_DEAL_CATEGORY_ID=0
+    #   BITRIX_STAGE_TRIGGER=NEW
+    #   BITRIX_STAGE_NDZ=UC_MLQD5A
+    #   BITRIX_STAGE_NDZ2=UC_PLCLW5
+    BITRIX_DEAL_CATEGORY_ID: str = "12"              # id воронки (0 = Продажи)
+    BITRIX_STAGE_TRIGGER: str = "C12:NEW"            # стадия, с которой стартует дозвон
+    BITRIX_STAGE_NDZ: str = "C12:PREPARATION"        # НДЗ (недозвон)
     BITRIX_STAGE_NDZ2: str = "C12:UC_DGYTDZ"         # НДЗ 2 (все попытки исчерпаны)
 
     # Отдельный webhook с правами на пользователей (user.*) — для назначения
