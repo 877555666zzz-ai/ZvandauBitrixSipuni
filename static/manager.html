@@ -331,14 +331,15 @@
 <script>
 let ME=null, CURRENT_LEAD=null, POLL=null, ACTIVE_TAB='call';
 const STAGES=[
-  {id:"C12:NEW",name:"Тёплые лиды"},{id:"C12:PREPARATION",name:"НДЗ"},
-  {id:"C12:UC_DGYTDZ",name:"НДЗ 2"},{id:"C12:PREPAYMENT_INVOIC",name:"ПЕРЕЗВОНИТЬ"},
-  {id:"C12:EXECUTING",name:"ХОЛОД"},{id:"C12:UC_CYJM1D",name:"Ссылка на рег"},
-  {id:"C12:UC_H47LCY",name:"Ссылка на регу НДЗ"},{id:"C12:UC_0QXBHN",name:"КП"},
-  {id:"C12:UC_XCF40E",name:"Создан"},{id:"C12:UC_LG27SJ",name:"Приглашен в хаб"},
-  {id:"C12:UC_GLR1Y1",name:"отправил промо"},{id:"C12:FINAL_INVOICE",name:"Активирован"},
-  {id:"C12:WON",name:"Сделка успешна"},{id:"C12:LOSE",name:"Сделка провалена"},
-  {id:"C12:APOLOGY",name:"Анализ причины провала"},
+  {id:"NEW",name:"Теплые лиды"},{id:"UC_MLQD5A",name:"Не дозвон"},
+  {id:"UC_CIPFTI",name:"Перезвон"},{id:"PREPAYMENT_INVOICE",name:"Назначенные на регу"},
+  {id:"UC_IU3TE8",name:"Потенциальный клиент"},{id:"UC_N50EB0",name:"Отправил заявку"},
+  {id:"PREPARATION",name:"КП"},{id:"UC_7LOXMF",name:"Холод"},
+  {id:"UC_PLCLW5",name:"Не дозвон 2"},{id:"UC_SHM8K6",name:"Не дозвон 3"},
+  {id:"UC_63IXGD",name:"Доп лиды"},{id:"UC_8SDZ0H",name:"Передача лида"},
+  {id:"UC_TSG3AM",name:"Слив на ИИК"},{id:"UC_F1Y6GX",name:"Мошенник"},
+  {id:"UC_JKXJUP",name:"НОМЕР НЕ АКТУАЛЕН"},{id:"EXECUTING",name:"Акцепт время"},
+  {id:"WON",name:"Сделка успешна"},{id:"LOSE",name:"Сделка провалена"},
 ];
 function toggleTheme(){const h=document.documentElement;const n=h.getAttribute('data-theme')==='dark'?'light':'dark';h.setAttribute('data-theme',n);document.getElementById('theme-btn').textContent=n==='dark'?'☾':'☀';}
 function toast(m,e){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(e?'err':'ok');setTimeout(()=>t.className='toast',2500);}
