@@ -25,12 +25,49 @@ from .db import Base
 
 
 # ─────────────────────────────────────────────
+class Department(Base):
+    """Отдел (проект): «Яндекс 360», «Яндекс Такси Казахстан» и т.п.
+
+    Каждый отдел жёстко привязан к своей воронке (CATEGORY_ID) Битрикс24 и
+    к своим стадиям. Менеджеры отдела видят и обрабатывают лиды ТОЛЬКО из
+    этой воронки/стадии — изоляция проектов друг от друга.
+    """
+    __tablename__ = "departments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True)
+
+    # ID воронки (CATEGORY_ID) Битрикс24, за которой закреплён отдел.
+    deal_category_id = Column(String, nullable=False)
+
+    # Стадия-триггер: с какой стадии автодозвон забирает лиды («Тёплые»).
+    # Формат как в BITRIX_STAGE_TRIGGER, напр. "C12:NEW" или "NEW".
+    stage_trigger = Column(String, nullable=False)
+
+    # Стадия НДЗ (недозвон, промежуточный) и НДЗ 2 (после исчерпания попыток).
+    # Необязательны: если не заданы — стадию сделки не двигаем.
+    stage_ndz = Column(String, nullable=True)
+    stage_ndz2 = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# ─────────────────────────────────────────────
 class Manager(Base):
     __tablename__ = "managers"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     sipnumber = Column(String, nullable=False)
+
+    # Отдел, к которому принадлежит менеджер. Определяет, из какой воронки/
+    # стадии ему будут идти лиды (изоляция проектов). NULL = менеджер не
+    # привязан ни к одному отделу — участвует в общем пуле (обратная
+    # совместимость со старыми конфигурациями без отделов).
+    department_id = Column(Integer, nullable=True, index=True)
 
     # Вход на личную страницу менеджера: логин уникален, пароль — хэш.
     # NULL = у менеджера ещё нет доступа к личной странице.
@@ -87,6 +124,10 @@ class AutodialQueue(Base):
     # лид уходит ТОЛЬКО этому менеджеру: свободен → звоним сразу, занят → ждём
     # именно его, на других НЕ раскидываем. NULL = обычный лид (любому свободному).
     target_manager_id = Column(Integer, nullable=True)
+
+    # Отдел, которому принадлежит лид (изоляция воронок). NULL = общий пул
+    # (обратная совместимость, если отделы не настроены).
+    department_id = Column(Integer, nullable=True, index=True)
 
     attempts = Column(Integer, default=0, nullable=False)
     next_call_time = Column(DateTime, nullable=False)
@@ -183,6 +224,10 @@ class CallSession(Base):
     # к этому же оператору (перевод адресный).
     is_transfer = Column(Boolean, default=False, nullable=False)
     target_manager_id = Column(Integer, nullable=True)
+
+    # Отдел, которому принадлежит лид (нужно, чтобы каскад/повтор/НДЗ-стадии
+    # оставались строго в рамках воронки этого отдела).
+    department_id = Column(Integer, nullable=True, index=True)
 
     __table_args__ = (
         Index("ix_call_sessions_lead_state", "lead_id", "state"),

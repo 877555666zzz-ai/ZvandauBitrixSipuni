@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoCall · Настройка отделов</title>
+<style>
+  :root {
+    --bg: #F3F4F7;
+    --panel: #FFFFFF;
+    --border: #E3E5EA;
+    --text: #1A1D24;
+    --muted: #6B7280;
+    --accent: #4F5BD5;
+    --accent-hover: #3E48B0;
+    --danger: #E0473E;
+    --danger-hover: #C43B33;
+    --ok: #17A672;
+    --radius: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 32px 20px 80px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; flex-wrap: wrap; gap: 12px; }
+  h1 { font-size: 22px; font-weight: 700; }
+  h1 span { color: var(--muted); font-weight: 500; font-size: 15px; display: block; margin-top: 4px; }
+  a.back { color: var(--accent); text-decoration: none; font-size: 14px; font-weight: 600; }
+  a.back:hover { text-decoration: underline; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 22px;
+    margin-bottom: 24px;
+  }
+  .panel h2 { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+  .panel .hint { color: var(--muted); font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: none; }
+  td.num { color: var(--muted); font-size: 13px; }
+
+  input[type=text], select {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 14px;
+    background: #fff;
+    color: var(--text);
+    font-family: inherit;
+  }
+  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 14px; border-radius: 8px; border: none;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: #fff;
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn.danger { background: transparent; color: var(--danger); border: 1px solid var(--border); }
+  .btn.danger:hover { background: #FBEAE9; border-color: var(--danger); }
+  .btn.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+  .btn.ghost:hover { background: #EEF0FE; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.small { padding: 6px 10px; font-size: 12px; }
+
+  .add-row { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr auto; gap: 8px; margin-top: 14px; align-items: end; }
+  .add-row label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+  @media (max-width: 900px) { .add-row { grid-template-columns: 1fr 1fr; } }
+
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 100px; font-size: 12px; font-weight: 600; background: #EEF0FE; color: var(--accent); }
+  .pill.none { background: #F1F2F4; color: var(--muted); }
+
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: #fff; padding: 10px 18px; border-radius: 10px;
+    font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(-6px); }
+  #toast.err { background: var(--danger); }
+
+  .empty { color: var(--muted); font-size: 13px; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Настройка отделов
+      <span>Изоляция проектов: воронка Битрикс24 + менеджеры закреплены за отделом</span>
+    </h1>
+    <a class="back" href="/">← Назад в дашборд</a>
+  </header>
+
+  <div class="panel">
+    <h2>Отделы</h2>
+    <div class="hint">
+      Каждый отдел жёстко привязан к своей воронке (CATEGORY_ID) Битрикс24 и стадии-триггеру
+      («Тёплые»). Автодозвон забирает лиды только из этой пары воронка+стадия и раздаёт их
+      только менеджерам этого отдела — исключая пересечение с другими проектами.
+      Стадии НДЗ / НДЗ 2 — необязательны: если не заданы, стадия сделки не двигается при недозвоне.
+    </div>
+    <table id="deptTable">
+      <thead>
+        <tr>
+          <th>Название</th>
+          <th>Воронка (CATEGORY_ID)</th>
+          <th>Стадия-триггер</th>
+          <th>НДЗ</th>
+          <th>НДЗ 2</th>
+          <th>Менеджеров</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="deptBody"></tbody>
+    </table>
+    <div class="add-row">
+      <div>
+        <label>Название</label>
+        <input type="text" id="newName" placeholder="Яндекс Такси Казахстан">
+      </div>
+      <div>
+        <label>Воронка (CATEGORY_ID)</label>
+        <input type="text" id="newCategory" placeholder="0">
+      </div>
+      <div>
+        <label>Стадия-триггер</label>
+        <input type="text" id="newTrigger" placeholder="UC_MLQD5A">
+      </div>
+      <div>
+        <label>Стадия НДЗ</label>
+        <input type="text" id="newNdz" placeholder="необязательно">
+      </div>
+      <div>
+        <label>Стадия НДЗ 2</label>
+        <input type="text" id="newNdz2" placeholder="необязательно">
+      </div>
+      <button class="btn" id="addDeptBtn">+ Добавить отдел</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Менеджеры и их отделы</h2>
+    <div class="hint">
+      Выберите отдел для каждого менеджера — он унаследует воронку отдела. Менеджер без отдела
+      участвует в общем пуле (только если отделы вообще не настроены).
+    </div>
+    <table id="mgrTable">
+      <thead>
+        <tr>
+          <th>Менеджер</th>
+          <th>Ext.</th>
+          <th>Отдел</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="mgrBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API = '';
+
+function toast(msg, isErr) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = isErr ? 'show err' : 'show';
+  setTimeout(() => { t.className = ''; }, 2600);
+}
+
+async function api(path, opts) {
+  const res = await fetch(API + path, Object.assign({
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+  }, opts || {}));
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const j = await res.json(); detail = j.detail || j.error || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+let departments = [];
+let managers = [];
+
+async function loadAll() {
+  try {
+    [departments, managers] = await Promise.all([
+      api('/departments'),
+      api('/managers'),
+    ]);
+    renderDepartments();
+    renderManagers();
+  } catch (e) {
+    toast('Ошибка загрузки: ' + e.message, true);
+  }
+}
+
+function renderDepartments() {
+  const body = document.getElementById('deptBody');
+  if (!departments.length) {
+    body.innerHTML = '<tr><td colspan="7"><div class="empty">Отделов пока нет — добавьте первый ниже. Пока отделов нет, автодозвон работает по старым настройкам из .env (один общий проект).</div></td></tr>';
+    return;
+  }
+  body.innerHTML = departments.map(d => `
+    <tr data-id="${d.id}">
+      <td><input type="text" class="f-name" value="${escapeHtml(d.name)}"></td>
+      <td><input type="text" class="f-cat" value="${escapeHtml(d.deal_category_id)}"></td>
+      <td><input type="text" class="f-trigger" value="${escapeHtml(d.stage_trigger)}"></td>
+      <td><input type="text" class="f-ndz" value="${escapeHtml(d.stage_ndz || '')}"></td>
+      <td><input type="text" class="f-ndz2" value="${escapeHtml(d.stage_ndz2 || '')}"></td>
+      <td class="num">${d.managers_count}</td>
+      <td style="white-space:nowrap">
+        <button class="btn small ghost" data-action="save">Сохранить</button>
+        <button class="btn small danger" data-action="delete">Удалить</button>
+      </td>
+    </tr>
+  `).join('');
+
+  body.querySelectorAll('tr').forEach(row => {
+    const id = row.dataset.id;
+    row.querySelector('[data-action=save]').addEventListener('click', async () => {
+      try {
+        await api(`/departments/${id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: row.querySelector('.f-name').value.trim(),
+            deal_category_id: row.querySelector('.f-cat').value.trim(),
+            stage_trigger: row.querySelector('.f-trigger').value.trim(),
+            stage_ndz: row.querySelector('.f-ndz').value.trim(),
+            stage_ndz2: row.querySelector('.f-ndz2').value.trim(),
+          }),
+        });
+        toast('Отдел сохранён');
+        loadAll();
+      } catch (e) {
+        toast('Не удалось сохранить: ' + e.message, true);
+      }
+    });
+    row.querySelector('[data-action=delete]').addEventListener('click', async () => {
+      if (!confirm('Удалить отдел? Менеджеры отдела останутся, но потеряют привязку к нему.')) return;
+      try {
+        await api(`/departments/${id}`, { method: 'DELETE' });
+        toast('Отдел удалён');
+        loadAll();
+      } catch (e) {
+        toast('Не удалось удалить: ' + e.message, true);
+      }
+    });
+  });
+}
+
+function renderManagers() {
+  const body = document.getElementById('mgrBody');
+  if (!managers.length) {
+    body.innerHTML = '<tr><td colspan="4"><div class="empty">Менеджеров пока нет.</div></td></tr>';
+    return;
+  }
+  const options = ['<option value="">— без отдела —</option>']
+    .concat(departments.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`))
+    .join('');
+
+  body.innerHTML = managers.map(m => `
+    <tr data-id="${m.id}">
+      <td>${escapeHtml(m.name)}</td>
+      <td class="num">${escapeHtml(m.sipnumber)}</td>
+      <td>
+        <select class="f-dept">${options}</select>
+      </td>
+      <td><button class="btn small ghost" data-action="save">Сохранить</button></td>
+    </tr>
+  `).join('');
+
+  body.querySelectorAll('tr').forEach(row => {
+    const id = row.dataset.id;
+    const mgr = managers.find(m => String(m.id) === id);
+    const select = row.querySelector('.f-dept');
+    select.value = mgr && mgr.department_id != null ? String(mgr.department_id) : '';
+    row.querySelector('[data-action=save]').addEventListener('click', async () => {
+      try {
+        const val = select.value;
+        const payload = val ? { department_id: parseInt(val, 10) } : { clear_department: true };
+        await api(`/managers/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+        toast('Отдел менеджера обновлён');
+        loadAll();
+      } catch (e) {
+        toast('Не удалось сохранить: ' + e.message, true);
+      }
+    });
+  });
+}
+
+document.getElementById('addDeptBtn').addEventListener('click', async () => {
+  const name = document.getElementById('newName').value.trim();
+  const cat = document.getElementById('newCategory').value.trim();
+  const trigger = document.getElementById('newTrigger').value.trim();
+  const ndz = document.getElementById('newNdz').value.trim();
+  const ndz2 = document.getElementById('newNdz2').value.trim();
+  if (!name || !cat || !trigger) {
+    toast('Заполните название, воронку и стадию-триггер', true);
+    return;
+  }
+  try {
+    await api('/departments', {
+      method: 'POST',
+      body: JSON.stringify({
+        name, deal_category_id: cat, stage_trigger: trigger,
+        stage_ndz: ndz || null, stage_ndz2: ndz2 || null,
+      }),
+    });
+    document.getElementById('newName').value = '';
+    document.getElementById('newCategory').value = '';
+    document.getElementById('newTrigger').value = '';
+    document.getElementById('newNdz').value = '';
+    document.getElementById('newNdz2').value = '';
+    toast('Отдел добавлен');
+    loadAll();
+  } catch (e) {
+    toast('Не удалось добавить: ' + e.message, true);
+  }
+});
+
+loadAll();
+</script>
+</body>
+</html>

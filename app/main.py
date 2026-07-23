@@ -48,6 +48,7 @@ from .config import settings
 from .db import async_session_maker, init_db
 from .dispatcher import (
     autodial_worker,
+    find_department_for_deal,
     handle_sipuni_status,
     initiate_transfer,
     mark_busy_from_sipuni,
@@ -55,7 +56,7 @@ from .dispatcher import (
     process_new_lead,
     worker_last_tick,
 )
-from .models import AutodialQueue, CallLog, CallSession, Manager
+from .models import AutodialQueue, CallLog, CallSession, Department, Manager
 from . import manager_portal as portal
 from .sipuni_client import make_outbound_call, parse_sipuni_webhook
 
@@ -161,12 +162,31 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
 
 
 # ─── Root / health ──────────────────────────────────────────
+async def _departments_exist() -> bool:
+    async with async_session_maker() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(Department))
+        ).scalar_one()
+    return count > 0
+
+
 @app.get("/", include_in_schema=False)
 async def root(_: None = Depends(require_auth)):
     path = os.path.join("static", "dashboard.html")
     if os.path.isfile(path):
         return FileResponse(path)
     return JSONResponse({"ok": True, "service": "autocall"})
+
+
+@app.get("/admin/departments", include_in_schema=False)
+async def departments_ui(_: None = Depends(require_auth)):
+    """Страница «Настройка отделов»: создание отделов и привязка
+    менеджеров к ним. Отдельная простая HTML-страница (не часть
+    основного бандла дашборда), доступна по /admin/departments."""
+    path = os.path.join("static", "departments.html")
+    if os.path.isfile(path):
+        return FileResponse(path)
+    return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
 
 
 @app.get("/health")
@@ -180,20 +200,132 @@ async def health():
     }
 
 
+# ─── Отделы (многопоточность по проектам) ────────────────────
+class DepartmentCreate(BaseModel):
+    name: str
+    deal_category_id: str
+    stage_trigger: str
+    stage_ndz: Optional[str] = None
+    stage_ndz2: Optional[str] = None
+
+
+class DepartmentUpdate(BaseModel):
+    name: Optional[str] = None
+    deal_category_id: Optional[str] = None
+    stage_trigger: Optional[str] = None
+    stage_ndz: Optional[str] = None
+    stage_ndz2: Optional[str] = None
+
+
+def _dept_dict(d: Department, managers_count: int = 0) -> dict:
+    return {
+        "id": d.id,
+        "name": d.name,
+        "deal_category_id": d.deal_category_id,
+        "stage_trigger": d.stage_trigger,
+        "stage_ndz": d.stage_ndz,
+        "stage_ndz2": d.stage_ndz2,
+        "managers_count": managers_count,
+    }
+
+
+@app.get("/departments")
+async def list_departments(_: None = Depends(require_auth)):
+    async with async_session_maker() as session:
+        result = await session.execute(select(Department).order_by(Department.id))
+        depts = list(result.scalars().all())
+        counts: dict = {}
+        if depts:
+            cres = await session.execute(
+                select(Manager.department_id, func.count(Manager.id))
+                .group_by(Manager.department_id)
+            )
+            counts = {row[0]: row[1] for row in cres.all()}
+    return [_dept_dict(d, counts.get(d.id, 0)) for d in depts]
+
+
+@app.post("/departments", status_code=201)
+async def create_department(data: DepartmentCreate, _: None = Depends(require_auth)):
+    async with async_session_maker() as session:
+        existing = await session.execute(
+            select(Department).where(Department.name == data.name)
+        )
+        if existing.scalars().first():
+            raise HTTPException(status_code=409, detail="department_name_taken")
+        dept = Department(
+            name=data.name,
+            deal_category_id=data.deal_category_id,
+            stage_trigger=data.stage_trigger,
+            stage_ndz=data.stage_ndz,
+            stage_ndz2=data.stage_ndz2,
+        )
+        session.add(dept)
+        await session.commit()
+        await session.refresh(dept)
+    logger.info("[department] создан отдел %s (воронка=%s)", dept.name, dept.deal_category_id)
+    return _dept_dict(dept)
+
+
+@app.put("/departments/{department_id}")
+async def update_department(
+    department_id: int, data: DepartmentUpdate, _: None = Depends(require_auth)
+):
+    async with async_session_maker() as session:
+        dept = await session.get(Department, department_id)
+        if not dept:
+            raise HTTPException(status_code=404, detail="department_not_found")
+        if data.name is not None:
+            dept.name = data.name
+        if data.deal_category_id is not None:
+            dept.deal_category_id = data.deal_category_id
+        if data.stage_trigger is not None:
+            dept.stage_trigger = data.stage_trigger
+        if data.stage_ndz is not None:
+            dept.stage_ndz = data.stage_ndz or None
+        if data.stage_ndz2 is not None:
+            dept.stage_ndz2 = data.stage_ndz2 or None
+        await session.commit()
+        await session.refresh(dept)
+    logger.info("[department] обновлён отдел #%d (%s)", dept.id, dept.name)
+    return _dept_dict(dept)
+
+
+@app.delete("/departments/{department_id}")
+async def delete_department(department_id: int, _: None = Depends(require_auth)):
+    async with async_session_maker() as session:
+        dept = await session.get(Department, department_id)
+        if not dept:
+            raise HTTPException(status_code=404, detail="department_not_found")
+        # Менеджеров отдела НЕ удаляем — просто отвязываем (они уходят в общий
+        # пул без изоляции, пока их не переназначат на другой отдел).
+        result = await session.execute(
+            select(Manager).where(Manager.department_id == department_id)
+        )
+        for m in result.scalars().all():
+            m.department_id = None
+        await session.delete(dept)
+        await session.commit()
+    logger.info("[department] удалён отдел #%d", department_id)
+    return {"ok": True, "deleted": department_id}
+
+
 # ─── Managers ───────────────────────────────────────────────
 class ManagerCreate(BaseModel):
     name: str
     sipnumber: str
     online: bool = True
+    department_id: Optional[int] = None
 
 
 class ManagerUpdate(BaseModel):
     name: Optional[str] = None
     sipnumber: Optional[str] = None
     online: Optional[bool] = None
+    department_id: Optional[int] = None
+    clear_department: bool = False
 
 
-def _mgr_dict(m: Manager) -> dict:
+def _mgr_dict(m: Manager, department_name: Optional[str] = None) -> dict:
     paused = bool(getattr(m, "paused", False))
     on_call = bool(getattr(m, "on_call", False))
     awaiting_ready = bool(getattr(m, "awaiting_ready", False))
@@ -211,6 +343,8 @@ def _mgr_dict(m: Manager) -> dict:
         "id": m.id,
         "name": m.name,
         "sipnumber": m.sipnumber,
+        "department_id": getattr(m, "department_id", None),
+        "department_name": department_name,
         "online": bool(m.online),
         "paused": paused,
         "on_call": on_call,
@@ -226,20 +360,36 @@ def _mgr_dict(m: Manager) -> dict:
 async def list_managers(_: None = Depends(require_auth)):
     async with async_session_maker() as session:
         result = await session.execute(select(Manager).order_by(Manager.id))
-        return [_mgr_dict(m) for m in result.scalars().all()]
+        managers = list(result.scalars().all())
+        dept_names: dict = {}
+        dept_ids = {m.department_id for m in managers if m.department_id is not None}
+        if dept_ids:
+            dres = await session.execute(
+                select(Department).where(Department.id.in_(dept_ids))
+            )
+            dept_names = {d.id: d.name for d in dres.scalars().all()}
+    return [_mgr_dict(m, dept_names.get(m.department_id)) for m in managers]
 
 
 @app.post("/managers", status_code=201)
 async def create_manager(data: ManagerCreate, _: None = Depends(require_auth)):
     async with async_session_maker() as session:
+        if data.department_id is not None:
+            dept = await session.get(Department, data.department_id)
+            if not dept:
+                raise HTTPException(status_code=404, detail="department_not_found")
         mgr = Manager(
             name=data.name, sipnumber=data.sipnumber, online=data.online,
+            department_id=data.department_id,
             missed=0, accepted_calls=0,
         )
         session.add(mgr)
         await session.commit()
         await session.refresh(mgr)
-    logger.info("[manager] добавлен %s (ext=%s)", mgr.name, mgr.sipnumber)
+    logger.info(
+        "[manager] добавлен %s (ext=%s, отдел=%s)",
+        mgr.name, mgr.sipnumber, mgr.department_id,
+    )
     return _mgr_dict(mgr)
 
 
@@ -259,6 +409,13 @@ async def update_manager(
             mgr.online = data.online
             if data.online:
                 mgr.missed = 0
+        if data.clear_department:
+            mgr.department_id = None
+        elif data.department_id is not None:
+            dept = await session.get(Department, data.department_id)
+            if not dept:
+                raise HTTPException(status_code=404, detail="department_not_found")
+            mgr.department_id = data.department_id
         await session.commit()
         await session.refresh(mgr)
     return _mgr_dict(mgr)
@@ -909,24 +1066,46 @@ async def bitrix_deal_webhook(
             return
 
         result = deal.get("result") or {}
-
-        # Фильтр: только целевая воронка (из настроек, по умолчанию Я360=12)
         category_id = str(result.get("CATEGORY_ID") or "")
-        if category_id != str(settings.BITRIX_DEAL_CATEGORY_ID):
-            logger.info(
-                "[webhook-deal] сделка #%d: category=%s, не наша воронка (%s) — игнор",
-                d_id, category_id, settings.BITRIX_DEAL_CATEGORY_ID,
-            )
-            return
-
-        # Фильтр: только триггерная стадия (из настроек)
         stage = result.get("STAGE_ID") or ""
-        if stage != settings.BITRIX_STAGE_TRIGGER:
+
+        # Если в базе настроены отделы (см. /departments) — работаем СТРОГО
+        # по ним: воронка+стадия сделки должны совпасть с воронкой+триггерной
+        # стадией какого-то отдела, иначе сделку игнорируем (изоляция
+        # проектов — см. ТЗ «Многопоточность по отделам»).
+        # Если отделов ещё не создано — старое поведение: один общий
+        # BITRIX_DEAL_CATEGORY_ID / BITRIX_STAGE_TRIGGER из .env.
+        department_id: Optional[int] = None
+        dept = await find_department_for_deal(category_id, stage)
+        any_departments = await _departments_exist()
+        if any_departments:
+            if not dept:
+                logger.info(
+                    "[webhook-deal] сделка #%d: category=%s stage=%s не "
+                    "совпадает ни с одним отделом — игнор",
+                    d_id, category_id, stage,
+                )
+                return
+            department_id = dept.id
             logger.info(
-                "[webhook-deal] сделка #%d: стадия=%s, не триггер (%s) — игнор",
-                d_id, stage, settings.BITRIX_STAGE_TRIGGER,
+                "[webhook-deal] сделка #%d → отдел «%s» (id=%d)",
+                d_id, dept.name, dept.id,
             )
-            return
+        else:
+            # Фильтр: только целевая воронка (из настроек, по умолчанию Я360=12)
+            if category_id != str(settings.BITRIX_DEAL_CATEGORY_ID):
+                logger.info(
+                    "[webhook-deal] сделка #%d: category=%s, не наша воронка (%s) — игнор",
+                    d_id, category_id, settings.BITRIX_DEAL_CATEGORY_ID,
+                )
+                return
+            # Фильтр: только триггерная стадия (из настроек)
+            if stage != settings.BITRIX_STAGE_TRIGGER:
+                logger.info(
+                    "[webhook-deal] сделка #%d: стадия=%s, не триггер (%s) — игнор",
+                    d_id, stage, settings.BITRIX_STAGE_TRIGGER,
+                )
+                return
 
         # Телефон: всеядный поиск — сделка → контакт(ы) → компания (поля, UF, названия)
         phone = await find_deal_phone(deal)
@@ -960,6 +1139,7 @@ async def bitrix_deal_webhook(
             lead_name=meta.get("name"),
             lead_source=meta.get("source"),
             received_at=ts,
+            department_id=department_id,
         )
 
     background_tasks.add_task(_process_deal, deal_id, received_at)

@@ -24,12 +24,54 @@ from sqlalchemy.exc import IntegrityError
 from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status, update_deal_stage, assign_deal_responsible
 from .config import settings
 from .db import async_session_maker
-from .models import AutodialQueue, CallLog, CallSession, LeadLock, Manager
+from .models import AutodialQueue, CallLog, CallSession, Department, LeadLock, Manager
 from .priority import record_outcome, sort_managers
 from .sipuni_client import make_outbound_call
 from .telegram import send_alert
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# Отделы (многопоточность по проектам)
+# ─────────────────────────────────────────────
+async def get_department(department_id: Optional[int]) -> Optional[Department]:
+    """Загрузить отдел по ID. None -> None (без обращения к БД)."""
+    if department_id is None:
+        return None
+    async with async_session_maker() as session:
+        return await session.get(Department, department_id)
+
+
+async def find_department_for_deal(category_id: str, stage_id: str) -> Optional[Department]:
+    """Найти отдел, за которым закреплена эта воронка (CATEGORY_ID) и у которого
+    указанная стадия — стадия-триггер. Если отделов вообще нет в базе - None
+    (тогда webhook сработает по старой, "одноворонковой" логике из .env)."""
+    async with async_session_maker() as session:
+        result = await session.execute(select(Department))
+        depts = list(result.scalars().all())
+    if not depts:
+        return None
+    for d in depts:
+        if str(d.deal_category_id) == str(category_id) and d.stage_trigger == stage_id:
+            return d
+    return None
+
+
+async def _stage_ndz(department_id: Optional[int]) -> Optional[str]:
+    """Стадия НДЗ (недозвон) для отдела, либо дефолт из .env."""
+    dept = await get_department(department_id)
+    if dept and dept.stage_ndz:
+        return dept.stage_ndz
+    return settings.BITRIX_STAGE_NDZ
+
+
+async def _stage_ndz2(department_id: Optional[int]) -> Optional[str]:
+    """Стадия НДЗ 2 (после исчерпания всех попыток) для отдела, либо дефолт."""
+    dept = await get_department(department_id)
+    if dept and dept.stage_ndz2:
+        return dept.stage_ndz2
+    return settings.BITRIX_STAGE_NDZ2
 
 
 # ─────────────────────────────────────────────
@@ -150,12 +192,24 @@ def _next_delay_minutes(attempt_number: int) -> int:
     return 30
 
 
-async def _get_available_managers(exclude_manager_id: Optional[int] = None) -> List[Manager]:
+async def _get_available_managers(
+    exclude_manager_id: Optional[int] = None,
+    department_id: Optional[int] = None,
+) -> List[Manager]:
+    """
+    department_id задан → изоляция проектов: берём ТОЛЬКО менеджеров этого
+    отдела (Manager.department_id == department_id). Менеджеры других отделов
+    и без отдела в выборку не попадают - лид не может «утечь» в чужой проект.
+
+    department_id=None → отделы не используются (обратная совместимость):
+    берём всех online-менеджеров, как раньше.
+    """
     now = datetime.utcnow()
     async with async_session_maker() as session:
-        result = await session.execute(
-            select(Manager).where(Manager.online.is_(True))
-        )
+        query = select(Manager).where(Manager.online.is_(True))
+        if department_id is not None:
+            query = query.where(Manager.department_id == department_id)
+        result = await session.execute(query)
         managers = list(result.scalars().all())
     # Отсеиваем занятых: busy_until в будущем = ещё на звонке.
     # Отсеиваем «на звонке» (on_call) — пока звонок не завершён, второй ему НЕ шлём.
@@ -361,6 +415,7 @@ async def schedule_autodial(
     next_call_time: Optional[datetime] = None,
     target_manager_id: Optional[int] = None,
     last_manager_sipnumber: Optional[str] = None,
+    department_id: Optional[int] = None,
 ) -> None:
     next_attempt = current_attempts + 1
 
@@ -389,7 +444,9 @@ async def schedule_autodial(
         )
         await update_lead_status(lead_id, "failed")
         # Все попытки исчерпаны, лид так и не ответил → стадия НДЗ 2
-        await update_deal_stage(lead_id, settings.BITRIX_STAGE_NDZ2)
+        # (своя для каждого отдела, если отдел задан).
+        ndz2_stage = await _stage_ndz2(department_id)
+        await update_deal_stage(lead_id, ndz2_stage)
         # Вешаем ответственным последнего оператора, к которому шла попытка
         # (клиент не ответил, но лид должен остаться закреплён за оператором).
         if last_manager_sipnumber:
@@ -425,6 +482,8 @@ async def schedule_autodial(
             item.state = "SCHEDULED"
             if target_manager_id is not None:
                 item.target_manager_id = target_manager_id
+            if department_id is not None:
+                item.department_id = department_id
         else:
             session.add(
                 AutodialQueue(
@@ -433,6 +492,7 @@ async def schedule_autodial(
                     lead_name=lead_name,
                     lead_source=lead_source,
                     target_manager_id=target_manager_id,
+                    department_id=department_id,
                     attempts=next_attempt,
                     next_call_time=next_call_time,
                     state="SCHEDULED",
@@ -473,6 +533,7 @@ async def _enqueue_waiting(
     lead_source: Optional[str] = None,
     insert_if_missing: bool = True,
     target_manager_id: Optional[int] = None,
+    department_id: Optional[int] = None,
 ) -> bool:
     now = datetime.utcnow()
     async with async_session_maker() as session:
@@ -489,6 +550,8 @@ async def _enqueue_waiting(
             item.state = "WAITING"
             if target_manager_id is not None:
                 item.target_manager_id = target_manager_id
+            if department_id is not None:
+                item.department_id = department_id
             # attempts НЕ трогаем — ожидание не списывает попытку дозвона
         elif insert_if_missing:
             session.add(
@@ -498,6 +561,7 @@ async def _enqueue_waiting(
                     lead_name=lead_name,
                     lead_source=lead_source,
                     target_manager_id=target_manager_id,
+                    department_id=department_id,
                     attempts=attempts,
                     next_call_time=now,
                     state="WAITING",
@@ -581,8 +645,13 @@ async def process_new_lead(
     from_queue: bool = False,
     target_manager_id: Optional[int] = None,
     is_transfer: bool = False,
+    department_id: Optional[int] = None,
 ) -> Dict:
     """
+    department_id — отдел, которому принадлежит лид/сделка (изоляция
+    проектов). Если задан, свободного оператора ищем ТОЛЬКО среди менеджеров
+    этого отдела. None = отделы не используются (общий пул, как раньше).
+
     received_at — когда webhook пришёл от Bitrix. Используется для метрики
     «время реакции» (от webhook'а до первого callback'а).
 
@@ -633,6 +702,7 @@ async def process_new_lead(
             lead_id, client_phone, current_attempts=0,
             lead_name=lead_name, lead_source=lead_source,
             next_call_time=next_open,
+            department_id=department_id,
         )
         await _release_lead(lead_id)
         return {"ok": True, "status": "outside_working_hours", "lead_id": lead_id}
@@ -658,13 +728,13 @@ async def process_new_lead(
                         lead_id, target_manager_id,
                     )
                     target_manager_id = None
-                    managers = await _get_available_managers()
+                    managers = await _get_available_managers(department_id=department_id)
                     manager = managers[0] if managers else None
                 else:
                     # Свободен → резервируем; занят → manager=None (ждём ИМЕННО его).
                     manager = tgt if (tgt and _is_manager_free(tgt)) else None
             else:
-                managers = await _get_available_managers()
+                managers = await _get_available_managers(department_id=department_id)
                 manager = managers[0] if managers else None
             if manager is not None:
                 await _set_busy(manager.id, _BUSY_GUARD_SECONDS, on_call=True)
@@ -680,6 +750,7 @@ async def process_new_lead(
                 lead_name=lead_name, lead_source=lead_source,
                 insert_if_missing=not from_queue,
                 target_manager_id=target_manager_id,
+                department_id=department_id,
             )
             if first_time:
                 logger.warning(
@@ -744,6 +815,7 @@ async def process_new_lead(
                         is_autodial=is_autodial,
                         is_transfer=is_transfer,
                         target_manager_id=target_manager_id,
+                        department_id=department_id,
                         attempts_used=len(attempts),
                     )
                 )
@@ -812,6 +884,7 @@ async def process_new_lead(
             lead_name=lead_name, lead_source=lead_source,
             insert_if_missing=not from_queue,
             target_manager_id=target_manager_id,
+            department_id=department_id,
         )
         await update_lead_status(lead_id, "retry")
         await _log_call(
@@ -959,6 +1032,7 @@ async def handle_sipuni_status(
                 await schedule_autodial(
                     s.lead_id, s.phone, current_attempts=s.attempts_used,
                     target_manager_id=s.target_manager_id,
+                    department_id=s.department_id,
                 )
                 await update_lead_status(s.lead_id, "retry")
                 await add_lead_comment(
@@ -970,6 +1044,7 @@ async def handle_sipuni_status(
             await _enqueue_waiting(
                 s.lead_id, s.phone, attempts=s.attempts_used,
                 target_manager_id=s.target_manager_id,
+                department_id=s.department_id,
             )
             await update_lead_status(s.lead_id, "retry")
             await add_lead_comment(
@@ -990,7 +1065,9 @@ async def handle_sipuni_status(
         # до клиента, его НЕЛЬЗЯ каскадить (иначе клиента дёргают подряд без пауз).
         # Такой случай уходит ниже на таймерный перезвон (+5/15/30).
         if not manager_answered:
-            next_free = await _get_available_managers(exclude_manager_id=s.manager_id)
+            next_free = await _get_available_managers(
+                exclude_manager_id=s.manager_id, department_id=s.department_id,
+            )
             if next_free:
                 logger.info(
                     "[sipuni-webhook] лид %d: %s не взял трубку → каскад к следующему (%s)",
@@ -1008,6 +1085,7 @@ async def handle_sipuni_status(
                     lead_name=None, lead_source=None,
                     is_autodial=True,  # не пишем дубль в working-hours/duplicate
                     received_at=datetime.utcnow(),
+                    department_id=s.department_id,
                 )
                 return {"ok": True, "matched": True, "state": "NO_ANSWER_CASCADED"}
 
@@ -1024,9 +1102,11 @@ async def handle_sipuni_status(
             await schedule_autodial(
                 s.lead_id, s.phone, current_attempts=s.attempts_used,
                 last_manager_sipnumber=s.manager_sipnumber,
+                department_id=s.department_id,
             )
             await update_lead_status(s.lead_id, "retry")
-            await update_deal_stage(s.lead_id, settings.BITRIX_STAGE_NDZ)
+            ndz_stage = await _stage_ndz(s.department_id)
+            await update_deal_stage(s.lead_id, ndz_stage)
             await add_lead_comment(
                 s.lead_id,
                 "Клиент не ответил — лид поставлен в автодозвон на повтор.",
@@ -1040,6 +1120,7 @@ async def handle_sipuni_status(
         )
         await _enqueue_waiting(
             s.lead_id, s.phone, attempts=s.attempts_used,
+            department_id=s.department_id,
         )
         await update_lead_status(s.lead_id, "retry")
         await add_lead_comment(
@@ -1120,6 +1201,7 @@ async def initiate_transfer(
         is_transfer=True,
         target_manager_id=target_manager_id,
         received_at=datetime.utcnow(),
+        department_id=active.department_id,
     )
 
     status = res.get("status")
@@ -1195,6 +1277,7 @@ async def autodial_worker() -> None:
                 lead_name = item.lead_name
                 lead_source = item.lead_source
                 target_mgr = item.target_manager_id
+                dept_id = item.department_id
                 try:
                     res = await process_new_lead(
                         lead_id, phone,
@@ -1204,6 +1287,7 @@ async def autodial_worker() -> None:
                         from_queue=True,
                         target_manager_id=target_mgr,
                         is_transfer=target_mgr is not None,
+                        department_id=dept_id,
                     )
                     status = res.get("status")
                     if status == "callback_created":
@@ -1224,6 +1308,7 @@ async def autodial_worker() -> None:
                         await schedule_autodial(
                             lead_id, phone, current_attempts=attempts,
                             lead_name=lead_name, lead_source=lead_source,
+                            department_id=dept_id,
                         )
                 except Exception as e:
                     logger.error(

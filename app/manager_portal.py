@@ -224,14 +224,23 @@ async def get_colleagues(exclude_manager_id: int) -> list:
     Оффлайн-операторов не показываем — перекинуть можно только на того, кто
     на линии. У каждого — статус free/busy, чтобы оператор видел, уйдёт звонок
     сразу или встанет в ожидание к этому коллеге.
+
+    Изоляция отделов: если у оператора задан department_id, коллеги
+    показываются ТОЛЬКО из его же отдела (перевод не должен утекать лид в
+    другой проект). Если отдел не задан (отделы не настроены) — прежнее
+    поведение: все online-коллеги.
     """
     now = datetime.utcnow()
     async with async_session_maker() as session:
-        result = await session.execute(
+        me = await session.get(Manager, exclude_manager_id)
+        query = (
             select(Manager)
             .where(Manager.online.is_(True))
             .where(Manager.id != exclude_manager_id)
         )
+        if me is not None and getattr(me, "department_id", None) is not None:
+            query = query.where(Manager.department_id == me.department_id)
+        result = await session.execute(query)
         managers = list(result.scalars().all())
     managers.sort(key=lambda m: (m.name or "").lower())
     out = []

@@ -97,6 +97,32 @@ async def init_db() -> None:
                 except Exception:
                     pass  # колонка уже есть
 
+        # Миграция под отделы (многопоточность по проектам): department_id
+        # в managers / autodial_queue / call_sessions. Таблица departments
+        # создаётся автоматически через create_all выше.
+        if settings.DATABASE_URL.startswith("postgresql"):
+            await conn.execute(text(
+                "ALTER TABLE managers ADD COLUMN IF NOT EXISTS department_id INTEGER"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE autodial_queue ADD COLUMN IF NOT EXISTS department_id INTEGER"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS department_id INTEGER"
+            ))
+        else:
+            for table, col, typ in (
+                ("managers", "department_id", "INTEGER"),
+                ("autodial_queue", "department_id", "INTEGER"),
+                ("call_sessions", "department_id", "INTEGER"),
+            ):
+                try:
+                    await conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {typ}"
+                    ))
+                except Exception:
+                    pass  # колонка уже есть
+
         # При старте сервиса сбрасываем «занятость» менеджеров и снимаем все
         # блокировки лидов: после рестарта старые звонки уже не активны, а
         # подвисшие busy_until/блокировки иначе держали бы менеджеров и лиды
