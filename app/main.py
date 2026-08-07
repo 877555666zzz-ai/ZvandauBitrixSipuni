@@ -670,6 +670,28 @@ async def get_analytics(
             local_hour = (l.timestamp + timedelta(hours=5)).hour
             hourly[local_hour] += 1
 
+    # Динамика по дням (локальная дата Алматы) — для спарклайнов в дашборде.
+    # Нулевые дни не пропускаются, а показываются явно (честные данные,
+    # а не выдуманный тренд).
+    daily_buckets: dict = {}
+    for l in logs:
+        if l.type not in ("initial", "autodial"):
+            continue
+        local_date = (l.timestamp + timedelta(hours=5)).date()
+        d = daily_buckets.setdefault(local_date, {"total": 0, "connected": 0})
+        d["total"] += 1
+        if l.status == "connected":
+            d["connected"] += 1
+    daily = []
+    for i in range(days - 1, -1, -1):
+        day = (datetime.utcnow() + timedelta(hours=5) - timedelta(days=i)).date()
+        b = daily_buckets.get(day, {"total": 0, "connected": 0})
+        daily.append({
+            "date": day.isoformat(),
+            "total": b["total"],
+            "connected": b["connected"],
+        })
+
     # Конверсия по каждому менеджеру: connected vs no_answer из логов.
     per_mgr: dict = {}
     for l in logs:
@@ -689,6 +711,7 @@ async def get_analytics(
         "no_answer": no_answer,
         "no_managers": no_managers,
         "failed": failed,
+        "daily": daily,
         "initial_calls": initial_calls,
         "autodial_calls": autodial_calls,
         "conversion_rate": conversion_rate,
