@@ -24,13 +24,19 @@ class Settings(BaseSettings):
     BITRIX_STATUS_RETRY: Optional[str] = None
     BITRIX_STATUS_FAILED: Optional[str] = None
 
-    # ── Sipuni ───────────────────────────────────────────────
-    SIPUNI_USER: str
-    SIPUNI_SECRET: str
-    SIPUNI_API_BASE: str = "https://sipuni.com/api"
-
-    # Секрет для входящих webhook'ов от Sipuni.
-    SIPUNI_WEBHOOK_SECRET: Optional[str] = None
+    # ── Kcell Virtual PBX (CRM REST API) ─────────────────────
+    KCELL_ENABLED: bool = True
+    KCELL_API_BASE: str
+    KCELL_API_KEY: str
+    # Секрет для проверки входящих event-webhook'ов от Kcell.
+    KCELL_CRM_SECRET: Optional[str] = None
+    # Имя нашей CRM, как оно зарегистрировано в личном кабинете Kcell.
+    KCELL_CRM_NAME: str = "AutoCall"
+    # URL нашего сервера, зарегистрированный в Kcell как приёмник событий
+    # (используется только для справки/логирования; сам путь webhook —
+    # /kcell/webhook/event, см. main.py).
+    KCELL_CRM_URL: Optional[str] = None
+    KCELL_TIMEOUT_SECONDS: float = 10.0
 
     # ── Бизнес-параметры ─────────────────────────────────────
     MANAGER_ANSWER_TIMEOUT_SECONDS: int = 30
@@ -41,7 +47,6 @@ class Settings(BaseSettings):
     # (переключение на следующий звонок за ~15с, без простоя).
     AUTODIAL_POLL_INTERVAL_SECONDS: int = 15
     BITRIX_TIMEOUT_SECONDS: float = 8.0
-    SIPUNI_TIMEOUT_SECONDS: float = 10.0
 
     # Длительность звонка в сек, ниже которой не считаем «настоящим разговором»
     MIN_TALK_DURATION_SECONDS: int = 5
@@ -58,7 +63,7 @@ class Settings(BaseSettings):
     SEED_DEFAULT_MANAGERS: bool = False
 
     # HTTP Basic auth на dashboard и API.
-    # Если оба заданы — auth включён. Webhook'и (Bitrix/Sipuni) и /health
+    # Если оба заданы — auth включён. Webhook'и (Bitrix/Kcell) и /health
     # auth не требуют (они защищены своими секретами).
     DASHBOARD_USER: Optional[str] = None
     DASHBOARD_PASSWORD: Optional[str] = None

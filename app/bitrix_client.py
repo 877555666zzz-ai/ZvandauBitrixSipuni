@@ -104,7 +104,7 @@ def _looks_like_phone(s: str) -> Optional[str]:
         return None
     digits = re.sub(r"\D", "", s)
     if len(digits) >= _MIN_PHONE_DIGITS:
-        # сохраняем как есть (с + если был), Sipuni сам разберётся
+        # сохраняем как есть (с + если был), Kcell сам разберётся
         cleaned = _digits_only(s)
         return cleaned or None
     return None

@@ -49,16 +49,16 @@ from .db import async_session_maker, init_db
 from .dispatcher import (
     autodial_worker,
     find_department_for_deal,
-    handle_sipuni_status,
+    handle_kcell_event,
     initiate_transfer,
-    mark_busy_from_sipuni,
+    mark_busy_from_kcell,
     normalize_phone,
     process_new_lead,
     worker_last_tick,
 )
 from .models import AutodialQueue, CallLog, CallSession, Department, Manager
 from . import manager_portal as portal
-from .sipuni_client import make_outbound_call, parse_sipuni_webhook
+from .kcell_client import make_outbound_call, parse_kcell_event
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -136,7 +136,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="AutoCall · Bitrix24 + Sipuni",
+    title="AutoCall · Bitrix24 + Kcell",
     version="3.0.0",
     lifespan=lifespan,
 )
@@ -204,7 +204,12 @@ async def health():
 class DepartmentCreate(BaseModel):
     name: str
     deal_category_id: str
-    stage_trigger: str
+    # Прямое значение стадии-триггера (продвинутый режим/обратная совместимость).
+    # Если не задано — стадия выводится из stage_warm/stage_cold + active_stage.
+    stage_trigger: Optional[str] = None
+    stage_warm: Optional[str] = None
+    stage_cold: Optional[str] = None
+    active_stage: Optional[str] = None  # "warm" | "cold"
     stage_ndz: Optional[str] = None
     stage_ndz2: Optional[str] = None
 
@@ -213,8 +218,27 @@ class DepartmentUpdate(BaseModel):
     name: Optional[str] = None
     deal_category_id: Optional[str] = None
     stage_trigger: Optional[str] = None
+    stage_warm: Optional[str] = None
+    stage_cold: Optional[str] = None
+    active_stage: Optional[str] = None  # "warm" | "cold" — переключить активную стадию
     stage_ndz: Optional[str] = None
     stage_ndz2: Optional[str] = None
+
+
+def _resolve_active_stage(dept: Department, mode: str) -> str:
+    """Проверить и вернуть ID стадии для запрошенного режима (warm/cold).
+
+    Бросает HTTPException, если режим некорректен или соответствующий
+    вариант стадии у отдела ещё не заполнен — так переключатель не может
+    молча увести stage_trigger в пустоту/None.
+    """
+    mode = (mode or "").strip().lower()
+    if mode not in ("warm", "cold"):
+        raise HTTPException(status_code=400, detail="active_stage_must_be_warm_or_cold")
+    value = dept.stage_warm if mode == "warm" else dept.stage_cold
+    if not value:
+        raise HTTPException(status_code=400, detail=f"stage_{mode}_not_set")
+    return value
 
 
 def _dept_dict(d: Department, managers_count: int = 0) -> dict:
@@ -223,6 +247,9 @@ def _dept_dict(d: Department, managers_count: int = 0) -> dict:
         "name": d.name,
         "deal_category_id": d.deal_category_id,
         "stage_trigger": d.stage_trigger,
+        "stage_warm": d.stage_warm,
+        "stage_cold": d.stage_cold,
+        "active_stage": d.active_stage,
         "stage_ndz": d.stage_ndz,
         "stage_ndz2": d.stage_ndz2,
         "managers_count": managers_count,
@@ -255,10 +282,20 @@ async def create_department(data: DepartmentCreate, _: None = Depends(require_au
         dept = Department(
             name=data.name,
             deal_category_id=data.deal_category_id,
-            stage_trigger=data.stage_trigger,
+            stage_trigger=data.stage_trigger or "",
+            stage_warm=data.stage_warm,
+            stage_cold=data.stage_cold,
             stage_ndz=data.stage_ndz,
             stage_ndz2=data.stage_ndz2,
         )
+        if data.active_stage:
+            dept.stage_trigger = _resolve_active_stage(dept, data.active_stage)
+            dept.active_stage = data.active_stage.strip().lower()
+        elif not data.stage_trigger:
+            raise HTTPException(
+                status_code=400,
+                detail="stage_trigger_or_active_stage_required",
+            )
         session.add(dept)
         await session.commit()
         await session.refresh(dept)
@@ -278,12 +315,24 @@ async def update_department(
             dept.name = data.name
         if data.deal_category_id is not None:
             dept.deal_category_id = data.deal_category_id
-        if data.stage_trigger is not None:
-            dept.stage_trigger = data.stage_trigger
+        if data.stage_warm is not None:
+            dept.stage_warm = data.stage_warm or None
+        if data.stage_cold is not None:
+            dept.stage_cold = data.stage_cold or None
         if data.stage_ndz is not None:
             dept.stage_ndz = data.stage_ndz or None
         if data.stage_ndz2 is not None:
             dept.stage_ndz2 = data.stage_ndz2 or None
+        if data.active_stage is not None:
+            # Переключатель «Тёплые/Холодные»: пересчитывает stage_trigger из
+            # уже обновлённых (в этой же транзакции) stage_warm/stage_cold.
+            dept.stage_trigger = _resolve_active_stage(dept, data.active_stage)
+            dept.active_stage = data.active_stage.strip().lower()
+        elif data.stage_trigger is not None:
+            # Прямая правка stage_trigger (продвинутый режим) — переключатель
+            # больше не гарантированно совпадает с этим значением.
+            dept.stage_trigger = data.stage_trigger
+            dept.active_stage = None
         await session.commit()
         await session.refresh(dept)
     logger.info("[department] обновлён отдел #%d (%s)", dept.id, dept.name)
@@ -636,7 +685,7 @@ async def get_analytics(
         "period_days": days,
         "total_calls": total,
         "connected": connected,
-        "real_connected": real_connected,  # с подтверждением от Sipuni
+        "real_connected": real_connected,  # с подтверждением от Kcell
         "no_answer": no_answer,
         "no_managers": no_managers,
         "failed": failed,
@@ -696,7 +745,7 @@ async def cancel_autodial(lead_id: int, _: None = Depends(require_auth)):
         for row in q.scalars().all():
             await session.delete(row)
             removed_queue += 1
-        # закрыть незавершённые сессии этого лида, чтобы будущий Sipuni webhook
+        # закрыть незавершённые сессии этого лида, чтобы будущий Kcell event-webhook
         # их не подхватил (переводим в ERROR — он нигде не матчится)
         s = await session.execute(
             select(CallSession).where(
@@ -747,7 +796,7 @@ async def clear_autodial_queue(_: None = Depends(require_auth)):
         )).scalar_one()
         # вычищаем всю очередь
         await session.execute(delete(AutodialQueue))
-        # закрываем незавершённые сессии, чтобы Sipuni webhook их не подхватил
+        # закрываем незавершённые сессии, чтобы Kcell event-webhook их не подхватил
         s = await session.execute(
             select(CallSession).where(
                 CallSession.state.in_(["PENDING", "CALLBACK_CREATED"])
@@ -1146,31 +1195,31 @@ async def bitrix_deal_webhook(
     return {"ok": True, "deal_id": deal_id, "queued": True}
 
 
-# ─── Sipuni status webhook ──────────────────────────────────
-async def _check_sipuni_secret(request: Request) -> None:
-    if not settings.SIPUNI_WEBHOOK_SECRET:
+# ─── Kcell event webhook ─────────────────────────────────────
+async def _check_kcell_secret(request: Request) -> None:
+    if not settings.KCELL_CRM_SECRET:
         return
     incoming = (
         request.query_params.get("secret")
-        or request.headers.get("X-Sipuni-Secret")
+        or request.headers.get("X-Kcell-Secret")
         or ""
     )
-    if not secrets.compare_digest(incoming, settings.SIPUNI_WEBHOOK_SECRET):
-        raise HTTPException(status_code=403, detail="invalid_sipuni_secret")
+    if not secrets.compare_digest(incoming, settings.KCELL_CRM_SECRET):
+        raise HTTPException(status_code=403, detail="invalid_kcell_secret")
 
 
-@app.api_route("/sipuni/webhook/status", methods=["GET", "POST"])
-async def sipuni_status_webhook(
+@app.api_route("/kcell/webhook/event", methods=["GET", "POST"])
+async def kcell_event_webhook(
     request: Request,
-    _: None = Depends(_check_sipuni_secret),
+    _: None = Depends(_check_kcell_secret),
 ):
     """
-    Принимает webhook от Sipuni со статусом звонка. Поддерживает GET и POST,
-    JSON и form-data — Sipuni («События на АТС») шлёт GET с query-параметрами,
-    но оставляем POST/JSON/form на случай других схем интеграции.
+    Принимает событие (cmd=event) от Kcell CRM REST API со статусом звонка.
+    Поддерживает GET и POST, JSON и form-data — Kcell по умолчанию шлёт
+    POST JSON, но оставляем GET/form на случай других схем интеграции.
     """
     body: dict = {}
-    # 1) query-параметры (Sipuni "События на АТС" шлёт всё в URL через GET)
+    # 1) query-параметры (на случай, если Kcell шлёт часть данных в URL)
     for k, v in request.query_params.items():
         body[k] = v
     # 2) тело запроса, если есть (POST JSON или form) — дополняет/перекрывает
@@ -1189,26 +1238,37 @@ async def sipuni_status_webhook(
     if not isinstance(body, dict):
         body = {}
 
-    parsed = parse_sipuni_webhook(body)
-    logger.info("[sipuni-webhook] %s", parsed)
+    parsed = parse_kcell_event(body)
+    logger.info("[kcell-event] %s", parsed)
 
     # По ЛЮБОМУ звонку оператора (наш, чужой, входящий, из другой воронки)
     # обновляем его занятость — чтобы автодозвон не слал звонок поверх
-    # разговора. Срабатывает и на начало, и на завершение события.
-    await mark_busy_from_sipuni(
+    # разговора. Срабатывает и на промежуточное, и на финальное событие.
+    await mark_busy_from_kcell(
         sipnumber=parsed.get("sipnumber"),
         event_finished=bool(parsed.get("event_finished")),
     )
 
-    # event=3 — оператор реально взял трубку (соединение плеч). Приходит
-    # РАНЬШЕ финала. Назначаем ответственного сразу, чтобы оператор мог
-    # открыть карточку прямо во время разговора, не дожидаясь конца.
+    # Промежуточное событие (duration ещё не пришёл, status=ACCEPTED) —
+    # оператор реально взял трубку. Приходит РАНЬШЕ финала. Назначаем
+    # ответственного сразу, чтобы оператор мог открыть карточку прямо во
+    # время разговора, не дожидаясь конца.
     if parsed.get("event_connected"):
+        call_id = parsed.get("call_id")
         sip = parsed.get("sipnumber")
         phone = parsed.get("client_phone")
-        if sip and phone:
-            try:
-                async with async_session_maker() as session:
+        try:
+            async with async_session_maker() as session:
+                s = None
+                if call_id:
+                    result = await session.execute(
+                        select(CallSession).where(
+                            CallSession.kcell_call_id == str(call_id),
+                            CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]),
+                        ).order_by(CallSession.started_at.desc()).limit(1)
+                    )
+                    s = result.scalars().first()
+                if not s and sip and phone:
                     norm = normalize_phone(phone)
                     result = await session.execute(
                         select(CallSession).where(
@@ -1216,31 +1276,35 @@ async def sipuni_status_webhook(
                             CallSession.state.in_(["CALLBACK_CREATED", "CONNECTED"]),
                         ).order_by(CallSession.started_at.desc())
                     )
-                    for s in result.scalars().all():
-                        if normalize_phone(s.phone) == norm:
-                            # Помечаем, что менеджер реально взял трубку — это
-                            # сигнал для handle_sipuni_status: если потом клиент
-                            # не ответит, это недозвон ДО КЛИЕНТА (таймерный
-                            # перезвон), а не «менеджер не взял» (очередь ожидания).
-                            if s.connected_at is None:
-                                s.connected_at = datetime.utcnow()
-                                await session.commit()
-                            await assign_deal_responsible(s.lead_id, str(sip))
-                            logger.info(
-                                "[sipuni-webhook] лид %d: оператор взял трубку → "
-                                "назначен ответственным (sip=%s)", s.lead_id, sip,
-                            )
+                    for row in result.scalars().all():
+                        if normalize_phone(row.phone) == norm:
+                            s = row
                             break
-            except Exception as e:
-                logger.warning("[sipuni-webhook] event=3 assign failed: %s", e)
+                if s:
+                    # Помечаем, что менеджер реально взял трубку — это
+                    # сигнал для handle_kcell_event: если потом клиент
+                    # не ответит, это недозвон ДО КЛИЕНТА (таймерный
+                    # перезвон), а не «менеджер не взял» (очередь ожидания).
+                    if s.connected_at is None:
+                        s.connected_at = datetime.utcnow()
+                        await session.commit()
+                    if sip:
+                        await assign_deal_responsible(s.lead_id, str(sip))
+                    logger.info(
+                        "[kcell-event] лид %d: оператор взял трубку → "
+                        "назначен ответственным (sip=%s)", s.lead_id, sip,
+                    )
+        except Exception as e:
+            logger.warning("[kcell-event] event_connected assign failed: %s", e)
         return {"ok": True, "event": "connected"}
 
-    # Sipuni шлёт event=1 (звонок начат) и event=2 (завершён).
-    # Реагируем только на финальное событие, начало просто подтверждаем.
+    # Реагируем только на финальное событие (duration задан), начало
+    # (промежуточное событие) уже обработано выше.
     if not parsed.get("event_finished"):
         return {"ok": True, "ignored": "not_final_event"}
 
-    return await handle_sipuni_status(
+    return await handle_kcell_event(
+        call_id=parsed.get("call_id"),
         sipnumber=parsed.get("sipnumber"),
         client_phone=parsed.get("client_phone"),
         talk_seconds=parsed.get("talk_seconds"),
@@ -1478,8 +1542,8 @@ async def portal_action_task(data: PortalTask,
 
 # ─── Test endpoints ─────────────────────────────────────────
 if settings.ENABLE_TEST_ENDPOINTS:
-    @app.get("/test/sipuni_call")
-    async def test_sipuni_call(
+    @app.get("/test/kcell_call")
+    async def test_kcell_call(
         manager_id: int, client_phone: str, _: None = Depends(require_auth)
     ):
         async with async_session_maker() as session:
@@ -1487,7 +1551,7 @@ if settings.ENABLE_TEST_ENDPOINTS:
             if not mgr:
                 raise HTTPException(status_code=404, detail="manager_not_found")
             result = await make_outbound_call(mgr.sipnumber, client_phone)
-        return {"manager": _mgr_dict(mgr), "sipuni_response": result}
+        return {"manager": _mgr_dict(mgr), "kcell_response": result}
 
     @app.post("/test/lead")
     async def test_lead(

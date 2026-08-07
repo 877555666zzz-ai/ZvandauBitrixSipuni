@@ -1,14 +1,14 @@
 # AutoCall · Звандау · v3
 
-Автоматическая обработка входящих лидов из Bitrix24 → дозвон через Sipuni →
-распределение на свободного менеджера. С аналитикой, контролем дисциплины и
-Telegram-алертами.
+Автоматическая обработка входящих лидов из Bitrix24 → дозвон через Kcell
+Virtual PBX (CRM REST API) → распределение на свободного менеджера.
+С аналитикой, контролем дисциплины и Telegram-алертами.
 
 ---
 
 ## Что нового в v3
 
-- ✅ **Sipuni status webhook** — реальный `connected` отличается от `callback_created`
+- ✅ **Kcell event webhook** — реальный `connected` отличается от `callback_created`, сопоставление звонка по `callid`
 - ✅ **HTTP Basic auth** на dashboard и API
 - ✅ **Личные страницы менеджеров** `/manager/{id}` с кнопкой online/offline
 - ✅ **Имя и источник лида** из Bitrix → в БД и dashboard
@@ -97,7 +97,7 @@ https://<portal>.bitrix24.ru/rest/1/<TOKEN>/crm.status.list.json?filter[ENTITY_I
 - [Переменные окружения](#переменные-окружения)
 - [Деплой на Railway](#деплой-на-railway)
 - [Настройка Bitrix24](#настройка-bitrix24)
-- [Настройка Sipuni](#настройка-sipuni)
+- [Настройка Kcell](#настройка-kcell)
 - [Telegram-алерты](#telegram-алерты)
 - [Личные страницы менеджеров](#личные-страницы-менеджеров)
 - [API](#api)
@@ -112,13 +112,13 @@ https://<portal>.bitrix24.ru/rest/1/<TOKEN>/crm.status.list.json?filter[ENTITY_I
 │   ├── __init__.py
 │   ├── config.py
 │   ├── db.py
-│   ├── models.py            # +CallSession, +lead_name/source, +reaction/talk, +Department
-│   ├── sipuni_client.py     # +parse_sipuni_webhook
+│   ├── models.py            # +CallSession(+kcell_call_id), +lead_name/source, +reaction/talk, +Department
+│   ├── kcell_client.py      # +parse_kcell_event, makeCall/history через CRM REST API Kcell
 │   ├── bitrix_client.py     # +extract_lead_meta
 │   ├── priority.py          # persistent ManagerPriority с decay
 │   ├── telegram.py          # алерты
-│   ├── dispatcher.py        # +handle_sipuni_status, +отделы (изоляция воронок)
-│   └── main.py              # +auth, +sipuni webhook, +/manager/{id}, +/departments
+│   ├── dispatcher.py        # +handle_kcell_event, +отделы (изоляция воронок)
+│   └── main.py              # +auth, +kcell webhook, +/manager/{id}, +/departments
 ├── static/
 │   ├── dashboard.html
 │   └── departments.html     # «Настройка отделов» — /admin/departments
@@ -138,7 +138,7 @@ https://<portal>.bitrix24.ru/rest/1/<TOKEN>/crm.status.list.json?filter[ENTITY_I
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Минимум что нужно заполнить: BITRIX_WEBHOOK_URL, SIPUNI_USER, SIPUNI_SECRET
+# Минимум что нужно заполнить: BITRIX_WEBHOOK_URL, KCELL_API_BASE, KCELL_API_KEY
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -157,15 +157,15 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | Переменная | Описание |
 |---|---|
 | `BITRIX_WEBHOOK_URL` | URL входящего webhook твоего портала, со слэшем в конце |
-| `SIPUNI_USER` | ID интеграции Sipuni |
-| `SIPUNI_SECRET` | Секрет интеграции Sipuni |
+| `KCELL_API_BASE` | Базовый URL CRM REST API Kcell (напр. `https://<company>.vpbx.kcell.kz/crmapi/v1`) |
+| `KCELL_API_KEY` | Ключ доступа к CRM REST API Kcell |
 
 Для production обязательно ещё:
 
 | Переменная | Зачем |
 |---|---|
 | `WEBHOOK_SECRET` | защита `/bitrix/webhook/lead` |
-| `SIPUNI_WEBHOOK_SECRET` | защита `/sipuni/webhook/status` |
+| `KCELL_CRM_SECRET` | защита `/kcell/webhook/event` |
 | `DASHBOARD_USER` + `DASHBOARD_PASSWORD` | HTTP Basic на dashboard |
 | `MANAGER_PAGE_TOKEN` | защита личных страниц менеджеров |
 | `ENVIRONMENT=production` | флаг |
@@ -201,10 +201,10 @@ ENVIRONMENT=production
 ENABLE_TEST_ENDPOINTS=false
 LOG_LEVEL=INFO
 BITRIX_WEBHOOK_URL=https://...
-SIPUNI_USER=...
-SIPUNI_SECRET=...
+KCELL_API_BASE=https://<company>.vpbx.kcell.kz/crmapi/v1
+KCELL_API_KEY=...
 WEBHOOK_SECRET=<сгенерируй: openssl rand -hex 24>
-SIPUNI_WEBHOOK_SECRET=<сгенерируй>
+KCELL_CRM_SECRET=<сгенерируй>
 DASHBOARD_USER=admin
 DASHBOARD_PASSWORD=<сильный пароль>
 MANAGER_PAGE_TOKEN=<сгенерируй>
@@ -251,48 +251,56 @@ https://<portal>.bitrix24.ru/rest/1/<TOKEN>/crm.status.list?filter[ENTITY_ID]=ST
 
 ---
 
-## Настройка Sipuni
+## Настройка Kcell
 
-### 1. Базовая интеграция
+### 1. Базовая интеграция (CRM REST API)
 
-Sipuni → Настройки → Интеграции → API:
-- скопировать `user` и `secret` → `SIPUNI_USER`, `SIPUNI_SECRET`
+В личном кабинете Виртуальной АТС Kcell: Настройки → Интеграция с CRM →
+«Другая CRM (REST API)»:
+- зарегистрировать интеграцию, получить `KCELL_API_KEY` → в переменные окружения
+- при регистрации указывается наш webhook-URL, на который Kcell будет слать
+  события звонков (`KCELL_CRM_URL` + `/kcell/webhook/event`), и опционально
+  секрет подтверждения запросов → `KCELL_CRM_SECRET`
 - внутренние номера менеджеров (`100`, `205`, и т.п.) → в `/managers` через
   dashboard или API
 
-### 2. Status webhook (главное в v3!)
+### 2. Event webhook (главное в v3!)
 
 Это закрывает главную смысловую дыру MVP. Без него `connected` в логах =
-просто «Sipuni принял заявку», и аналитика по соединениям врёт.
+просто «Kcell принял заявку на звонок (makeCall)», и аналитика по
+соединениям врёт.
 
-Sipuni → Настройки → Интеграции → **Веб-хуки** (или Функции, в зависимости от
-тарифа):
-- Событие: **завершение исходящего звонка** (или «Окончание разговора»)
-- URL: `https://<domain>/sipuni/webhook/status?secret=<SIPUNI_WEBHOOK_SECRET>`
+В настройках интеграции Kcell CRM REST API укажи URL приёмника событий:
+- URL: `https://<domain>/kcell/webhook/event?secret=<KCELL_CRM_SECRET>`
 - Метод: POST
-- Формат: JSON или form-data — поддерживаются оба
+- Формат: JSON (form-data тоже поддерживается)
 
-Что Sipuni должен прислать (любое подмножество — наш парсер умеет):
-- `sipnumber` или `manager` или `internal` — внутренний номер
-- `phone` или `client_phone` или `external` — номер клиента
-- `duration` или `bill_seconds` или `billsec` — длительность разговора (сек)
-- `status` или `disposition` — `answered`/`completed`/`success` если ответил
+Конверт события, который разбирает `parse_kcell_event()` в
+`app/kcell_client.py`:
+- `cmd` — `"event"`
+- `callid` — id звонка, primary-ключ сопоставления с CallSession
+- `status` — `ACCEPTED` (разговор состоялся) или `CANCELLED`
+- `duration` — длительность разговора в секундах; наличие этого поля
+  считается признаком ФИНАЛЬНОГО события (без него — промежуточное,
+  «менеджер снял трубку»)
+- `from` / `to` — sipnumber менеджера / номер клиента (fallback-сопоставление,
+  если `callid` в событии почему-то не пришёл)
 
-Если в твоём кабинете Sipuni ключи другие — добавь свои варианты в
-`parse_sipuni_webhook()` в `app/sipuni_client.py`. Это безопасно, остальной
-код трогать не нужно.
+Если реальный конверт в твоём личном кабинете отличается по названиям полей —
+правится только `parse_kcell_event()`, остальной код (dispatcher, main)
+трогать не нужно.
 
 ### 3. Тест
 
 С `ENABLE_TEST_ENDPOINTS=true`:
 ```bash
-curl "https://<domain>/test/sipuni_call?manager_id=1&client_phone=77001234567" \
+curl "https://<domain>/test/kcell_call?manager_id=1&client_phone=77001234567" \
   -u <DASHBOARD_USER>:<DASHBOARD_PASSWORD>
 ```
 
-Sipuni должен позвонить на менеджера; после ответа набрать клиента; после
-завершения разговора прийдёт webhook → ты увидишь в `/logs` запись
-`status=connected` (а не `callback_created`).
+Kcell должен позвонить на менеджера (makeCall); после ответа набрать
+клиента; после завершения разговора придёт event-webhook → ты увидишь в
+`/logs` запись `status=connected` (а не `callback_created`).
 
 ---
 
@@ -357,23 +365,23 @@ https://<domain>/manager/{id}?token=<MANAGER_PAGE_TOKEN>
 | GET | `/logs?limit=100` | Логи + очередь |
 | GET | `/analytics?days=7` | Аналитика (с reaction_time) |
 | POST | `/bitrix/webhook/lead?secret=...` | Webhook от Bitrix |
-| POST | `/sipuni/webhook/status?secret=...` | Webhook от Sipuni |
-| GET | `/test/sipuni_call` | Только если `ENABLE_TEST_ENDPOINTS=true` |
+| POST | `/kcell/webhook/event?secret=...` | Event-webhook от Kcell |
+| GET | `/test/kcell_call` | Только если `ENABLE_TEST_ENDPOINTS=true` |
 | POST | `/test/lead` | Только если `ENABLE_TEST_ENDPOINTS=true` |
 
 ---
 
 ## Чек-лист первого запуска
 
-1. [ ] `cp .env.example .env`, заполнить `BITRIX_WEBHOOK_URL`, `SIPUNI_USER`, `SIPUNI_SECRET`
+1. [ ] `cp .env.example .env`, заполнить `BITRIX_WEBHOOK_URL`, `KCELL_API_BASE`, `KCELL_API_KEY`
 2. [ ] `pip install -r requirements.txt`
 3. [ ] `uvicorn app.main:app --reload` → проверить `/health`
 4. [ ] Добавить пару менеджеров через `/managers` или поставить `SEED_DEFAULT_MANAGERS=true`
-5. [ ] `ENABLE_TEST_ENDPOINTS=true` → `/test/sipuni_call?manager_id=1&client_phone=<свой_тел>` → должен прозвонить
+5. [ ] `ENABLE_TEST_ENDPOINTS=true` → `/test/kcell_call?manager_id=1&client_phone=<свой_тел>` → должен прозвонить
 6. [ ] Деплой на Railway + Postgres
-7. [ ] Сгенерировать `WEBHOOK_SECRET`, `SIPUNI_WEBHOOK_SECRET`, `MANAGER_PAGE_TOKEN`
+7. [ ] Сгенерировать `WEBHOOK_SECRET`, `KCELL_CRM_SECRET`, `MANAGER_PAGE_TOKEN`
 8. [ ] Настроить Bitrix outgoing webhook → `/bitrix/webhook/lead?secret=...`
-9. [ ] Настроить Sipuni webhook на завершение звонка → `/sipuni/webhook/status?secret=...`
+9. [ ] Настроить Kcell event-webhook на завершение звонка → `/kcell/webhook/event?secret=...`
 10. [ ] (опционально) Telegram-бот
 11. [ ] Создать тестовый лид в Bitrix → проверить, что прозвон пошёл
 12. [ ] Раздать менеджерам их персональные URL `/manager/{id}?token=...`
@@ -385,8 +393,8 @@ https://<domain>/manager/{id}?token=<MANAGER_PAGE_TOKEN>
 - Distributed lock (Redis SETNX / pg_advisory_lock) для multi-worker — сейчас
   идемпотентность только в памяти одного процесса. Для одного worker'а
   (default) это нормально.
-- E2E-тесты с моками Sipuni/Bitrix
+- E2E-тесты с моками Kcell/Bitrix
 - Sentry / структурированные логи в JSON
 - Bitrix24 SSO вместо HTTP Basic
 - Дневной отчёт в Telegram (агрегаты за день)
-- Sipuni call recordings — сохранять ссылки в CallLog
+- Kcell call recordings — сохранять ссылки в CallLog

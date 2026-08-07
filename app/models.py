@@ -4,7 +4,7 @@
   managers          — менеджеры + persistent priority
   autodial_queue    — очередь повторных дозвонов
   call_logs         — журнал событий (включает имя/источник лида, время реакции)
-  call_sessions    — активные «акты дозвона», нужны для Sipuni webhook
+  call_sessions    — активные «акты дозвона», нужны для Kcell event-webhook
 """
 from datetime import datetime
 
@@ -40,9 +40,23 @@ class Department(Base):
     # ID воронки (CATEGORY_ID) Битрикс24, за которой закреплён отдел.
     deal_category_id = Column(String, nullable=False)
 
-    # Стадия-триггер: с какой стадии автодозвон забирает лиды («Тёплые»).
-    # Формат как в BITRIX_STAGE_TRIGGER, напр. "C12:NEW" или "NEW".
+    # Стадия-триггер: с какой стадии автодозвон ФАКТИЧЕСКИ забирает лиды прямо
+    # сейчас. Формат как в BITRIX_STAGE_TRIGGER, напр. "C12:NEW" или "NEW".
+    # Это одно из значений stage_warm / stage_cold ниже — какое именно,
+    # определяет active_stage. Отдельное поле сохранено, чтобы весь остальной
+    # код (dispatcher/webhook) продолжал читать одно понятное значение, не
+    # зная про переключатель тёплые/холодные.
     stage_trigger = Column(String, nullable=False)
+
+    # Два предустановленных варианта стадии-триггера этого отдела — «Тёплые»
+    # и «Холодные» лиды. Администратор переключает их одной кнопкой в UI, не
+    # вспоминая ID стадии каждый раз. NULL = вариант ещё не настроен.
+    stage_warm = Column(String, nullable=True)
+    stage_cold = Column(String, nullable=True)
+
+    # Какой из двух вариантов сейчас активен (совпадает с stage_trigger):
+    # "warm" | "cold". Нужно только для отображения переключателя в UI.
+    active_stage = Column(String, nullable=True)
 
     # Стадия НДЗ (недозвон, промежуточный) и НДЗ 2 (после исчерпания попыток).
     # Необязательны: если не заданы — стадию сделки не двигаем.
@@ -161,7 +175,7 @@ class CallLog(Base):
     lead_name = Column(String, nullable=True)
     lead_source = Column(String, nullable=True)
 
-    # initial | autodial | test | sipuni_webhook
+    # initial | autodial | test | kcell_event
     type = Column(String, nullable=False)
 
     # callback_created | connected | no_answer | no_managers
@@ -173,7 +187,7 @@ class CallLog(Base):
 
     # Время реакции с момента webhook'а от Bitrix до первого callback'а
     reaction_seconds = Column(Float, nullable=True)
-    # Длительность реального разговора (приходит из Sipuni webhook)
+    # Длительность реального разговора (приходит из Kcell event-webhook)
     talk_seconds = Column(Float, nullable=True)
 
     message = Column(String, nullable=True)
@@ -189,11 +203,12 @@ class CallLog(Base):
 class CallSession(Base):
     """
     Активный «акт дозвона». Создаётся когда мы только начинаем обзванивать
-    менеджеров для конкретного лида. Завершается либо когда Sipuni webhook
+    менеджеров для конкретного лида. Завершается либо когда Kcell event-webhook
     подтвердил факт разговора, либо когда никто не ответил.
 
-    Нужно, чтобы при приходе Sipuni webhook'а понять, к какому лиду
-    относится этот звонок (по phone + sipnumber + времени).
+    kcell_call_id (callid) — первичный ключ сопоставления входящего события
+    Kcell с этой сессией. phone используется только как fallback, если
+    callid в событии почему-то не пришёл.
     """
     __tablename__ = "call_sessions"
 
@@ -204,14 +219,18 @@ class CallSession(Base):
     manager_name = Column(String, nullable=True)
     manager_sipnumber = Column(String, nullable=True, index=True)
 
+    # callid из ответа Kcell makeCall — по нему сопоставляем event-webhook
+    # с этой сессией (основной ключ поиска, приоритетнее phone/sipnumber).
+    kcell_call_id = Column(String, nullable=True, index=True, unique=False)
+
     # PENDING | CALLBACK_CREATED | CONNECTED | NO_ANSWER | ERROR
     state = Column(String, default="PENDING", nullable=False)
 
     # Когда пришёл webhook от Bitrix
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    # Когда Sipuni принял callback
+    # Когда Kcell принял заявку на звонок (makeCall → status=ACCEPTED)
     callback_at = Column(DateTime, nullable=True)
-    # Когда фактически был разговор (из Sipuni webhook)
+    # Когда фактически был разговор (из Kcell event-webhook)
     connected_at = Column(DateTime, nullable=True)
     # Длительность разговора
     talk_seconds = Column(Float, nullable=True)
@@ -220,8 +239,8 @@ class CallSession(Base):
     attempts_used = Column(Integer, default=0, nullable=False)
 
     # Перевод звонка на конкретного оператора. is_transfer=True + target_manager_id
-    # говорят вебхуку Sipuni: при недозвоне НЕ каскадить на других, а повторять
-    # к этому же оператору (перевод адресный).
+    # говорят обработчику событий Kcell: при недозвоне НЕ каскадить на других,
+    # а повторять к этому же оператору (перевод адресный).
     is_transfer = Column(Boolean, default=False, nullable=False)
     target_manager_id = Column(Integer, nullable=True)
 

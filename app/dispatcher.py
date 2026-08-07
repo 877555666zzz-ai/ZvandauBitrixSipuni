@@ -3,12 +3,13 @@
 Сердце проекта.
 
 process_new_lead(lead_id, phone, lead_name?, lead_source?):
-  1. Создать CallSession (это даст Sipuni webhook'у привязку к лиду).
+  1. Создать CallSession (это даст Kcell event-webhook'у привязку к лиду
+     по callid, полученному от makeCall).
   2. Получить online менеджеров.
-  3. По очереди создать callback каждому через Sipuni.
-  4. При callback_created: остановить цикл, ждать webhook от Sipuni
-     (если настроен) — он переведёт session в CONNECTED либо NO_ANSWER.
-  5. Если callback ни одному не создан → автодозвон.
+  3. По очереди инициировать звонок каждому через Kcell (makeCall).
+  4. При callback_created: остановить цикл, ждать event-webhook от Kcell
+     (cmd=event) — он переведёт session в CONNECTED либо NO_ANSWER.
+  5. Если ни одному звонок не инициирован → автодозвон.
 
 Idempotency: in-process set активных лидов.
 """
@@ -24,9 +25,9 @@ from sqlalchemy.exc import IntegrityError
 from .bitrix_client import add_deal_comment, add_lead_comment, update_lead_status, update_deal_stage, assign_deal_responsible
 from .config import settings
 from .db import async_session_maker
+from .kcell_client import make_outbound_call
 from .models import AutodialQueue, CallLog, CallSession, Department, LeadLock, Manager
 from .priority import record_outcome, sort_managers
-from .sipuni_client import make_outbound_call
 from .telegram import send_alert
 
 logger = logging.getLogger(__name__)
@@ -289,10 +290,10 @@ async def _release_after_cooldown(manager_id: int) -> None:
             await session.commit()
 
 
-async def mark_busy_from_sipuni(sipnumber: Optional[str], event_finished: bool) -> None:
-    """Отметить занятость нашего оператора по ЛЮБОМУ звонку из Sipuni.
+async def mark_busy_from_kcell(sipnumber: Optional[str], event_finished: bool) -> None:
+    """Отметить занятость нашего оператора по ЛЮБОМУ звонку из Kcell.
 
-    Sipuni шлёт события обо всех звонках на АТС — наших, чужих, входящих,
+    Kcell шлёт события обо всех звонках на АТС — наших, чужих, входящих,
     из других воронок. Если sipnumber совпадает с одним из НАШИХ операторов,
     значит этот оператор реально на линии (неважно по какому поводу) — и наш
     автодозвон не должен слать ему звонок поверх разговора.
@@ -715,7 +716,7 @@ async def process_new_lead(
         # Атомарно выбираем и резервируем ОДНОГО свободного оператора под общим
         # замком — чтобы два почти одновременных лида НЕ выбрали одного и того же
         # и не прислали ему два звонка. В замке только быстрый выбор+резерв;
-        # сетевой вызов Sipuni делаем уже ВНЕ замка.
+        # сетевой вызов Kcell делаем уже ВНЕ замка.
         async with _DISPATCH_LOCK:
             if target_manager_id is not None:
                 # Адресный дозвон (перевод): берём ТОЛЬКО целевого оператора.
@@ -790,18 +791,18 @@ async def process_new_lead(
             lead_id, manager.name, manager.sipnumber,
         )
         callback_start = datetime.utcnow()
-        sipuni_resp = await make_outbound_call(manager.sipnumber, client_phone)
+        kcell_resp = await make_outbound_call(manager.sipnumber, client_phone)
         attempts.append({
             "manager_id": manager.id,
             "manager_name": manager.name,
             "sipnumber": manager.sipnumber,
-            "sipuni_response": sipuni_resp,
+            "kcell_response": kcell_resp,
         })
 
-        if sipuni_resp.get("callback_created"):
+        if kcell_resp.get("callback_created"):
             reaction = (callback_start - received_at).total_seconds()
 
-            # Создаём CallSession — будем ждать Sipuni webhook
+            # Создаём CallSession — будем ждать Kcell event-webhook (по callid)
             async with async_session_maker() as session:
                 session.add(
                     CallSession(
@@ -810,6 +811,7 @@ async def process_new_lead(
                         manager_id=manager.id,
                         manager_name=manager.name,
                         manager_sipnumber=manager.sipnumber,
+                        kcell_call_id=kcell_resp.get("call_id"),
                         state="CALLBACK_CREATED",
                         callback_at=callback_start,
                         is_autodial=is_autodial,
@@ -829,7 +831,7 @@ async def process_new_lead(
             await record_outcome(manager.id, success=True)
             # Подтверждаем «на звонке» (резерв уже стоял; обновляем guard).
             # И сразу помечаем «ждём Готов»: даже если оператор повесит трубку
-            # без события завершения от Sipuni, ему всё равно не пойдёт второй
+            # без события завершения от Kcell, ему всё равно не пойдёт второй
             # звонок до нажатия «Готов принимать».
             async with async_session_maker() as ms:
                 mgr_obj = await ms.get(Manager, manager.id)
@@ -845,7 +847,7 @@ async def process_new_lead(
                 lead_name=lead_name, lead_source=lead_source,
                 manager_id=manager.id, manager_name=manager.name,
                 reaction_seconds=reaction,
-                message=f"Sipuni callback → {manager.name} (ext {manager.sipnumber})",
+                message=f"Kcell makeCall → {manager.name} (ext {manager.sipnumber})",
             )
 
             await update_lead_status(lead_id, "connected")
@@ -869,11 +871,12 @@ async def process_new_lead(
                 "attempts": attempts,
             }
 
-        # Sipuni не принял callback (линия оператора занята/недоступна).
-        # Снимаем резерв этого оператора и кладём лид в очередь ОЖИДАНИЯ —
-        # воркер перевыберет свободного через ~15с. Перебирать остальных прямо
-        # сейчас НЕ нужно (это и создавало риск второго звонка по устаревшему
-        # списку): если оператор не ОТВЕТИТ — каскад сам передаст лида дальше.
+        # Kcell не принял заявку на звонок (линия оператора занята/недоступна,
+        # status=CANCELLED). Снимаем резерв этого оператора и кладём лид в
+        # очередь ОЖИДАНИЯ — воркер перевыберет свободного через ~15с.
+        # Перебирать остальных прямо сейчас НЕ нужно (это и создавало риск
+        # второго звонка по устаревшему списку): если оператор не ОТВЕТИТ —
+        # каскад сам передаст лида дальше.
         await _set_busy(manager.id, 0, on_call=False)
         await record_outcome(manager.id, success=False)
         await _increment_missed(manager.id)
@@ -891,10 +894,10 @@ async def process_new_lead(
             lead_id=lead_id, phone=client_phone, call_type=call_type,
             status="no_answer", attempts=attempts,
             lead_name=lead_name, lead_source=lead_source,
-            message="Sipuni не принял callback — лид в очереди ожидания",
+            message="Kcell не принял makeCall — лид в очереди ожидания",
         )
         logger.info(
-            "[dispatch] лид %d: Sipuni не принял callback (%s) → очередь ожидания",
+            "[dispatch] лид %d: Kcell не принял makeCall (%s) → очередь ожидания",
             lead_id, manager.name,
         )
         return {
@@ -908,9 +911,10 @@ async def process_new_lead(
 
 
 # ─────────────────────────────────────────────
-# Sipuni webhook handler (вызывается из main)
+# Kcell event-webhook handler (вызывается из main)
 # ─────────────────────────────────────────────
-async def handle_sipuni_status(
+async def handle_kcell_event(
+    call_id: Optional[str],
     sipnumber: Optional[str],
     client_phone: Optional[str],
     talk_seconds: Optional[float],
@@ -918,44 +922,66 @@ async def handle_sipuni_status(
     raw: Dict,
 ) -> Dict:
     """
-    Найти активную CallSession по sipnumber + phone и закрыть её
-    реальным статусом. Если answered=False — поправить счётчики менеджера
-    (раньше мы инкрементнули accepted_calls по факту callback, теперь
-    откатываем) и поставить лид в автодозвон.
+    Найти активную CallSession и закрыть её реальным статусом.
+
+    Сопоставление — ПРЕЖДЕ ВСЕГО по call_id (callid из события Kcell,
+    сохранённому в CallSession.kcell_call_id при makeCall). Поиск по
+    phone/sipnumber используется только как fallback, если call_id в
+    событии не пришёл (не должно происходить в норме, но защищаемся).
+
+    Если answered=False — поправить счётчики менеджера (раньше мы
+    инкрементнули accepted_calls по факту makeCall, теперь откатываем) и
+    поставить лид в автодозвон.
     """
-    if not client_phone:
-        logger.warning("[sipuni-webhook] нет client_phone: %s", raw)
-        return {"ok": False, "error": "no_client_phone"}
-
-    # Нормализация — Sipuni может слать с/без +, с пробелами и т.п.
-    norm_phone = normalize_phone(client_phone)
-
-    async with async_session_maker() as session:
-        # Ищем последнюю «висящую» сессию по этому телефону
-        result = await session.execute(
-            select(CallSession)
-            .where(
-                CallSession.state == "CALLBACK_CREATED",
-            )
-            .order_by(CallSession.id.desc())
-            .limit(20)
-        )
-        candidates = list(result.scalars().all())
-
     matched: Optional[CallSession] = None
-    for s in candidates:
-        s_norm = normalize_phone(s.phone)
-        # Совпадение по нормализованному номеру (последние 10 цифр)
-        if s_norm and norm_phone and s_norm == norm_phone:
-            if sipnumber and s.manager_sipnumber and str(s.manager_sipnumber) != str(sipnumber):
-                continue
-            matched = s
-            break
+
+    if call_id:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(CallSession)
+                .where(
+                    CallSession.kcell_call_id == str(call_id),
+                    CallSession.state == "CALLBACK_CREATED",
+                )
+                .order_by(CallSession.id.desc())
+                .limit(1)
+            )
+            matched = result.scalars().first()
+
+    if not matched:
+        # Fallback: поиск по нормализованному телефону + sipnumber —
+        # используется, только если call_id отсутствовал в событии.
+        if not client_phone:
+            logger.warning("[kcell-event] нет call_id и нет client_phone: %s", raw)
+            return {"ok": False, "error": "no_call_id_no_phone"}
+
+        # Нормализация — Kcell может слать с/без +, с пробелами и т.п.
+        norm_phone = normalize_phone(client_phone)
+
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(CallSession)
+                .where(
+                    CallSession.state == "CALLBACK_CREATED",
+                )
+                .order_by(CallSession.id.desc())
+                .limit(20)
+            )
+            candidates = list(result.scalars().all())
+
+        for s in candidates:
+            s_norm = normalize_phone(s.phone)
+            # Совпадение по нормализованному номеру (последние 10 цифр)
+            if s_norm and norm_phone and s_norm == norm_phone:
+                if sipnumber and s.manager_sipnumber and str(s.manager_sipnumber) != str(sipnumber):
+                    continue
+                matched = s
+                break
 
     if not matched:
         logger.info(
-            "[sipuni-webhook] no matching session: phone=%s sipnumber=%s",
-            client_phone, sipnumber,
+            "[kcell-event] no matching session: call_id=%s phone=%s sipnumber=%s",
+            call_id, client_phone, sipnumber,
         )
         return {"ok": True, "matched": False}
 
@@ -973,7 +999,7 @@ async def handle_sipuni_status(
             await session.commit()
 
             await _log_call(
-                lead_id=s.lead_id, phone=s.phone, call_type="sipuni_webhook",
+                lead_id=s.lead_id, phone=s.phone, call_type="kcell_event",
                 status="connected", attempts=[],
                 manager_id=s.manager_id, manager_name=s.manager_name,
                 talk_seconds=talk_seconds,
@@ -993,7 +1019,7 @@ async def handle_sipuni_status(
             if s.manager_id:
                 await _release_after_cooldown(s.manager_id)
             logger.info(
-                "[sipuni-webhook] лид %d CONNECTED (%.0fс)",
+                "[kcell-event] лид %d CONNECTED (%.0fс)",
                 s.lead_id, talk_seconds or 0,
             )
             return {"ok": True, "matched": True, "state": "CONNECTED"}
@@ -1016,11 +1042,11 @@ async def handle_sipuni_status(
             await _release_after_cooldown(s.manager_id)
 
         await _log_call(
-            lead_id=s.lead_id, phone=s.phone, call_type="sipuni_webhook",
+            lead_id=s.lead_id, phone=s.phone, call_type="kcell_event",
             status="no_answer", attempts=[],
             manager_id=s.manager_id, manager_name=s.manager_name,
             talk_seconds=talk_seconds,
-            message="Sipuni: менеджер не ответил по факту",
+            message="Kcell: менеджер не ответил по факту",
         )
 
         # ── ПЕРЕВОД: адресный лид НЕ каскадим на других ─────────────
@@ -1070,7 +1096,7 @@ async def handle_sipuni_status(
             )
             if next_free:
                 logger.info(
-                    "[sipuni-webhook] лид %d: %s не взял трубку → каскад к следующему (%s)",
+                    "[kcell-event] лид %d: %s не взял трубку → каскад к следующему (%s)",
                     s.lead_id, s.manager_name, next_free[0].name,
                 )
                 await add_lead_comment(
@@ -1096,7 +1122,7 @@ async def handle_sipuni_status(
         #    очередь ОЖИДАНИЯ (дозвонимся, как только освободится оператор).
         if manager_answered:
             logger.info(
-                "[sipuni-webhook] лид %d: менеджер ответил, клиент не ответил → "
+                "[kcell-event] лид %d: менеджер ответил, клиент не ответил → "
                 "таймерный перезвон", s.lead_id,
             )
             await schedule_autodial(
@@ -1115,7 +1141,7 @@ async def handle_sipuni_status(
 
         # Менеджер не взял трубку — клиента не набирали → очередь ожидания.
         logger.info(
-            "[sipuni-webhook] лид %d: оператор не взял трубку, свободных нет → "
+            "[kcell-event] лид %d: оператор не взял трубку, свободных нет → "
             "очередь ожидания", s.lead_id,
         )
         await _enqueue_waiting(
@@ -1302,7 +1328,7 @@ async def autodial_worker() -> None:
                         # когда, возможно, кто-то освободится.
                         pass
                     else:
-                        # Менеджеры были, но callback не создался (сбой Sipuni)
+                        # Менеджеры были, но callback не создался (сбой Kcell)
                         # или иной исход → перезвон по таймеру (+5/+15/+30).
                         # Это реальная неудача попытки дозвона.
                         await schedule_autodial(

@@ -97,6 +97,20 @@ async def init_db() -> None:
                 except Exception:
                     pass  # колонка уже есть
 
+        # Миграция под Kcell CRM REST API: колонка callid на call_sessions —
+        # первичный ключ сопоставления входящего event-webhook с сессией.
+        if settings.DATABASE_URL.startswith("postgresql"):
+            await conn.execute(text(
+                "ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS kcell_call_id VARCHAR"
+            ))
+        else:
+            try:
+                await conn.execute(text(
+                    "ALTER TABLE call_sessions ADD COLUMN kcell_call_id VARCHAR"
+                ))
+            except Exception:
+                pass  # колонка уже есть
+
         # Миграция под отделы (многопоточность по проектам): department_id
         # в managers / autodial_queue / call_sessions. Таблица departments
         # создаётся автоматически через create_all выше.
@@ -122,6 +136,43 @@ async def init_db() -> None:
                     ))
                 except Exception:
                     pass  # колонка уже есть
+
+        # Миграция под переключатель «Тёплые/Холодные» стадии отдела:
+        # stage_warm/stage_cold — два предустановленных варианта стадии-триггера,
+        # active_stage — какой из них сейчас активен (для UI).
+        if settings.DATABASE_URL.startswith("postgresql"):
+            await conn.execute(text(
+                "ALTER TABLE departments ADD COLUMN IF NOT EXISTS stage_warm VARCHAR"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE departments ADD COLUMN IF NOT EXISTS stage_cold VARCHAR"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE departments ADD COLUMN IF NOT EXISTS active_stage VARCHAR"
+            ))
+        else:
+            for col, typ in (
+                ("stage_warm", "VARCHAR"),
+                ("stage_cold", "VARCHAR"),
+                ("active_stage", "VARCHAR"),
+            ):
+                try:
+                    await conn.execute(text(
+                        f"ALTER TABLE departments ADD COLUMN {col} {typ}"
+                    ))
+                except Exception:
+                    pass  # колонка уже есть
+        # Бэкфилл для отделов, созданных до переключателя: их текущий
+        # stage_trigger считаем «тёплым» вариантом (это и было прежнее
+        # поведение), чтобы ничего не сломать молча. Идемпотентно — трогает
+        # только строки, где stage_warm ещё не заполнен.
+        try:
+            await conn.execute(text(
+                "UPDATE departments SET stage_warm = stage_trigger, "
+                "active_stage = 'warm' WHERE stage_warm IS NULL"
+            ))
+        except Exception:
+            pass
 
         # При старте сервиса сбрасываем «занятость» менеджеров и снимаем все
         # блокировки лидов: после рестарта старые звонки уже не активны, а

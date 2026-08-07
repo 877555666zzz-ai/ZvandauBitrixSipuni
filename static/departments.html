@@ -81,6 +81,18 @@
   .pill { display: inline-block; padding: 2px 9px; border-radius: 100px; font-size: 12px; font-weight: 600; background: #EEF0FE; color: var(--accent); }
   .pill.none { background: #F1F2F4; color: var(--muted); }
 
+  .stage-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 100px; overflow: hidden; }
+  .stage-toggle button {
+    border: none; background: transparent; padding: 5px 12px; font-size: 12px; font-weight: 600;
+    cursor: pointer; color: var(--muted);
+  }
+  .stage-toggle button.warm.active { background: #FCEFE2; color: #B9660B; }
+  .stage-toggle button.cold.active { background: #E4F1FB; color: #1770A6; }
+  .stage-toggle button:disabled { cursor: not-allowed; opacity: .4; }
+  .stage-inputs { display: flex; flex-direction: column; gap: 4px; min-width: 140px; }
+  .stage-inputs label { font-size: 10px; color: var(--muted); font-weight: 600; }
+  .stage-inputs input { padding: 5px 8px; font-size: 12px; }
+
   #toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: var(--text); color: #fff; padding: 10px 18px; border-radius: 10px;
@@ -104,9 +116,11 @@
   <div class="panel">
     <h2>Отделы</h2>
     <div class="hint">
-      Каждый отдел жёстко привязан к своей воронке (CATEGORY_ID) Битрикс24 и стадии-триггеру
-      («Тёплые»). Автодозвон забирает лиды только из этой пары воронка+стадия и раздаёт их
-      только менеджерам этого отдела — исключая пересечение с другими проектами.
+      Каждый отдел жёстко привязан к своей воронке (CATEGORY_ID) Битрикс24 и активной стадии-триггеру.
+      Автодозвон забирает лиды только из этой пары воронка+стадия и раздаёт их только менеджерам
+      этого отдела — исключая пересечение с другими проектами.
+      Заполните ID стадии «Тёплые» и/или «Холодные» и кнопкой переключайте, какую из них забирает
+      автодозвон прямо сейчас — не нужно помнить и перепечатывать ID стадии каждый раз.
       Стадии НДЗ / НДЗ 2 — необязательны: если не заданы, стадия сделки не двигается при недозвоне.
     </div>
     <table id="deptTable">
@@ -114,7 +128,8 @@
         <tr>
           <th>Название</th>
           <th>Воронка (CATEGORY_ID)</th>
-          <th>Стадия-триггер</th>
+          <th>Тёплые / Холодные (ID стадий)</th>
+          <th>Активна</th>
           <th>НДЗ</th>
           <th>НДЗ 2</th>
           <th>Менеджеров</th>
@@ -133,8 +148,19 @@
         <input type="text" id="newCategory" placeholder="0">
       </div>
       <div>
-        <label>Стадия-триггер</label>
-        <input type="text" id="newTrigger" placeholder="UC_MLQD5A">
+        <label>Тёплые (ID стадии)</label>
+        <input type="text" id="newWarm" placeholder="необязательно">
+      </div>
+      <div>
+        <label>Холодные (ID стадии)</label>
+        <input type="text" id="newCold" placeholder="UC_MLQD5A">
+      </div>
+      <div>
+        <label>Активна сейчас</label>
+        <select id="newActive">
+          <option value="cold">Холодные</option>
+          <option value="warm">Тёплые</option>
+        </select>
       </div>
       <div>
         <label>Стадия НДЗ</label>
@@ -219,14 +245,27 @@ async function loadAll() {
 function renderDepartments() {
   const body = document.getElementById('deptBody');
   if (!departments.length) {
-    body.innerHTML = '<tr><td colspan="7"><div class="empty">Отделов пока нет — добавьте первый ниже. Пока отделов нет, автодозвон работает по старым настройкам из .env (один общий проект).</div></td></tr>';
+    body.innerHTML = '<tr><td colspan="8"><div class="empty">Отделов пока нет — добавьте первый ниже. Пока отделов нет, автодозвон работает по старым настройкам из .env (один общий проект).</div></td></tr>';
     return;
   }
   body.innerHTML = departments.map(d => `
     <tr data-id="${d.id}">
       <td><input type="text" class="f-name" value="${escapeHtml(d.name)}"></td>
       <td><input type="text" class="f-cat" value="${escapeHtml(d.deal_category_id)}"></td>
-      <td><input type="text" class="f-trigger" value="${escapeHtml(d.stage_trigger)}"></td>
+      <td>
+        <div class="stage-inputs">
+          <label>Тёплые</label>
+          <input type="text" class="f-warm" value="${escapeHtml(d.stage_warm || '')}" placeholder="ID стадии">
+          <label>Холодные</label>
+          <input type="text" class="f-cold" value="${escapeHtml(d.stage_cold || '')}" placeholder="ID стадии">
+        </div>
+      </td>
+      <td>
+        <div class="stage-toggle">
+          <button type="button" class="warm${d.active_stage === 'warm' ? ' active' : ''}" data-action="activate-warm" ${d.stage_warm ? '' : 'disabled title="Сначала укажите ID стадии Тёплые"'}>Тёплые</button>
+          <button type="button" class="cold${d.active_stage === 'cold' ? ' active' : ''}" data-action="activate-cold" ${d.stage_cold ? '' : 'disabled title="Сначала укажите ID стадии Холодные"'}>Холодные</button>
+        </div>
+      </td>
       <td><input type="text" class="f-ndz" value="${escapeHtml(d.stage_ndz || '')}"></td>
       <td><input type="text" class="f-ndz2" value="${escapeHtml(d.stage_ndz2 || '')}"></td>
       <td class="num">${d.managers_count}</td>
@@ -239,18 +278,22 @@ function renderDepartments() {
 
   body.querySelectorAll('tr').forEach(row => {
     const id = row.dataset.id;
+
+    async function saveFields(extra) {
+      const payload = Object.assign({
+        name: row.querySelector('.f-name').value.trim(),
+        deal_category_id: row.querySelector('.f-cat').value.trim(),
+        stage_warm: row.querySelector('.f-warm').value.trim(),
+        stage_cold: row.querySelector('.f-cold').value.trim(),
+        stage_ndz: row.querySelector('.f-ndz').value.trim(),
+        stage_ndz2: row.querySelector('.f-ndz2').value.trim(),
+      }, extra || {});
+      return api(`/departments/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+    }
+
     row.querySelector('[data-action=save]').addEventListener('click', async () => {
       try {
-        await api(`/departments/${id}`, {
-          method: 'PUT',
-          body: JSON.stringify({
-            name: row.querySelector('.f-name').value.trim(),
-            deal_category_id: row.querySelector('.f-cat').value.trim(),
-            stage_trigger: row.querySelector('.f-trigger').value.trim(),
-            stage_ndz: row.querySelector('.f-ndz').value.trim(),
-            stage_ndz2: row.querySelector('.f-ndz2').value.trim(),
-          }),
-        });
+        await saveFields();
         toast('Отдел сохранён');
         loadAll();
       } catch (e) {
@@ -265,6 +308,28 @@ function renderDepartments() {
         loadAll();
       } catch (e) {
         toast('Не удалось удалить: ' + e.message, true);
+      }
+    });
+    const warmBtn = row.querySelector('[data-action=activate-warm]');
+    const coldBtn = row.querySelector('[data-action=activate-cold]');
+    if (warmBtn) warmBtn.addEventListener('click', async () => {
+      try {
+        // Сохраняем заодно и текущие правки полей — так переключение не
+        // «съедает» ещё не сохранённый только что введённый ID стадии.
+        await saveFields({ active_stage: 'warm' });
+        toast('Активна стадия «Тёплые»');
+        loadAll();
+      } catch (e) {
+        toast('Не удалось переключить: ' + e.message, true);
+      }
+    });
+    if (coldBtn) coldBtn.addEventListener('click', async () => {
+      try {
+        await saveFields({ active_stage: 'cold' });
+        toast('Активна стадия «Холодные»');
+        loadAll();
+      } catch (e) {
+        toast('Не удалось переключить: ' + e.message, true);
       }
     });
   });
@@ -313,24 +378,33 @@ function renderManagers() {
 document.getElementById('addDeptBtn').addEventListener('click', async () => {
   const name = document.getElementById('newName').value.trim();
   const cat = document.getElementById('newCategory').value.trim();
-  const trigger = document.getElementById('newTrigger').value.trim();
+  const warm = document.getElementById('newWarm').value.trim();
+  const cold = document.getElementById('newCold').value.trim();
+  const active = document.getElementById('newActive').value;
   const ndz = document.getElementById('newNdz').value.trim();
   const ndz2 = document.getElementById('newNdz2').value.trim();
-  if (!name || !cat || !trigger) {
-    toast('Заполните название, воронку и стадию-триггер', true);
+  if (!name || !cat || (!warm && !cold)) {
+    toast('Заполните название, воронку и хотя бы один ID стадии (тёплые/холодные)', true);
+    return;
+  }
+  if ((active === 'warm' && !warm) || (active === 'cold' && !cold)) {
+    toast(`Укажите ID стадии «${active === 'warm' ? 'Тёплые' : 'Холодные'}» — она выбрана как активная`, true);
     return;
   }
   try {
     await api('/departments', {
       method: 'POST',
       body: JSON.stringify({
-        name, deal_category_id: cat, stage_trigger: trigger,
+        name, deal_category_id: cat,
+        stage_warm: warm || null, stage_cold: cold || null,
+        active_stage: active,
         stage_ndz: ndz || null, stage_ndz2: ndz2 || null,
       }),
     });
     document.getElementById('newName').value = '';
     document.getElementById('newCategory').value = '';
-    document.getElementById('newTrigger').value = '';
+    document.getElementById('newWarm').value = '';
+    document.getElementById('newCold').value = '';
     document.getElementById('newNdz').value = '';
     document.getElementById('newNdz2').value = '';
     toast('Отдел добавлен');

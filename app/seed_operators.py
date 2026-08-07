@@ -1,11 +1,11 @@
 # app/seed_operators.py
-"""Разовый скрипт: завести операторов отдела «Продажи» с их номерами Sipuni
+"""Разовый скрипт: завести операторов отдела «Продажи» с их номерами Kcell
 и логинами/паролями для портала.
 
 Запуск (локально или через Railway → Shell):
     python -m app.seed_operators
 
-Идемпотентно: если оператор с таким номером Sipuni уже есть — обновит имя,
+Идемпотентно: если оператор с таким номером Kcell уже есть — обновит имя,
 логин и пароль; если нет — создаст. Повторный запуск безопасен.
 
 По умолчанию новые операторы создаются ОФФЛАЙН (online=False), чтобы звонки
@@ -20,7 +20,7 @@ from .db import async_session_maker, init_db
 from .manager_portal import hash_password
 from .models import Manager
 
-# (Имя, номер Sipuni, логин, пароль)
+# (Имя, номер Kcell, логин, пароль)
 OPERATORS = [
     ("Бекмухамбетова Дина",        "211", "Dina",     "Dina123"),
     ("Тилеумурат Луиза",           "238", "Luiza",    "Luiza123"),
@@ -44,7 +44,7 @@ async def main() -> None:
     created, updated = 0, 0
     async with async_session_maker() as session:
         for name, sipnumber, login, password in OPERATORS:
-            # Ищем по номеру Sipuni (он уникален для оператора)
+            # Ищем по номеру Kcell (он уникален для оператора)
             result = await session.execute(
                 select(Manager).where(Manager.sipnumber == str(sipnumber))
             )
