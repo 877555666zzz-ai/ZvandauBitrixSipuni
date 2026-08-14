@@ -25,6 +25,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select
+from sqlalchemy.exc import IntegrityError
 
 from .bitrix_client import (
     add_deal_comment,
@@ -372,6 +373,8 @@ class ManagerUpdate(BaseModel):
     online: Optional[bool] = None
     department_id: Optional[int] = None
     clear_department: bool = False
+    login: Optional[str] = None
+    new_password: Optional[str] = None
 
 
 def _mgr_dict(m: Manager, department_name: Optional[str] = None) -> dict:
@@ -465,7 +468,15 @@ async def update_manager(
             if not dept:
                 raise HTTPException(status_code=404, detail="department_not_found")
             mgr.department_id = data.department_id
-        await session.commit()
+        if data.login is not None:
+            mgr.login = data.login
+        if data.new_password:
+            mgr.password_hash = portal.hash_password(data.new_password)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="login_taken")
         await session.refresh(mgr)
     return _mgr_dict(mgr)
 
