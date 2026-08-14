@@ -60,6 +60,7 @@ from .dispatcher import (
 from .models import AutodialQueue, CallLog, CallSession, Department, Manager
 from . import manager_portal as portal
 from .kcell_client import make_outbound_call, parse_kcell_event
+from .telegram import send_alert
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -1076,20 +1077,49 @@ async def bitrix_lead_webhook(
             lead = await get_lead(l_id)
         except Exception as e:
             logger.error("[webhook] get_lead(%d) failed: %s", l_id, e)
+            await send_alert(
+                f"🔴 Лид #{l_id}: не удалось получить данные из Bitrix — "
+                f"автодозвон НЕ запущен. Обработайте вручную. ({e})"
+            )
             return
 
-        phone = extract_phone(lead)
-        if not phone:
-            logger.warning("[webhook] лид #%d: нет телефона", l_id)
-            return
+        # Тот же принцип, что и в /bitrix/webhook/deal: ответ Bitrix'у уже ушёл
+        # ({"ok": true}), эта функция выполняется в фоне — необработанное
+        # исключение здесь означало бы лид без единого следа, что недопустимо.
+        try:
+            phone = extract_phone(lead)
+            if not phone:
+                logger.warning("[webhook] лид #%d: нет телефона", l_id)
+                await add_lead_comment(
+                    l_id,
+                    "Автодозвон: не удалось запустить — в лиде нет номера телефона.",
+                )
+                return
 
-        meta = extract_lead_meta(lead)
-        await process_new_lead(
-            l_id, phone,
-            lead_name=meta.get("name"),
-            lead_source=meta.get("source"),
-            received_at=ts,
-        )
+            meta = extract_lead_meta(lead)
+            await process_new_lead(
+                l_id, phone,
+                lead_name=meta.get("name"),
+                lead_source=meta.get("source"),
+                received_at=ts,
+            )
+        except Exception as e:
+            logger.error(
+                "[webhook] лид #%d: необработанная ошибка — лид НЕ обработан: %s",
+                l_id, e, exc_info=True,
+            )
+            try:
+                await add_lead_comment(
+                    l_id,
+                    "Автодозвон: техническая ошибка, звонок НЕ запущен. "
+                    "Обработайте этот лид вручную и сообщите администратору.",
+                )
+            except Exception:
+                pass
+            await send_alert(
+                f"🔴 Лид #{l_id}: техническая ошибка автодозвона — лид НЕ "
+                f"обработан, нужна ручная обработка! ({e})"
+            )
 
     background_tasks.add_task(_process, lead_id, received_at)
     return {"ok": True, "lead_id": lead_id, "queued": True}
@@ -1146,84 +1176,112 @@ async def bitrix_deal_webhook(
             deal = await get_deal(d_id)
         except Exception as e:
             logger.error("[webhook-deal] get_deal(%d) failed: %s", d_id, e)
+            await send_alert(
+                f"🔴 Сделка #{d_id}: не удалось получить данные из Bitrix — "
+                f"автодозвон НЕ запущен. Обработайте вручную. ({e})"
+            )
             return
 
-        result = deal.get("result") or {}
-        category_id = str(result.get("CATEGORY_ID") or "")
-        stage = result.get("STAGE_ID") or ""
+        # ВАЖНО: этот webhook уже ответил Bitrix'у {"ok": true} до того, как
+        # эта функция вообще начала работать (она в background_tasks) — если
+        # здесь вылетит необработанное исключение, снаружи никто об этом не
+        # узнает, а лид останется НЕ обзвоненным без единого следа в Bitrix.
+        # Поэтому вся обработка — под общим try/except: любая ошибка обязана
+        # оставить комментарий в сделке и алерт в Telegram, а не исчезнуть.
+        try:
+            result = deal.get("result") or {}
+            category_id = str(result.get("CATEGORY_ID") or "")
+            stage = result.get("STAGE_ID") or ""
 
-        # Если в базе настроены отделы (см. /departments) — работаем СТРОГО
-        # по ним: воронка+стадия сделки должны совпасть с воронкой+триггерной
-        # стадией какого-то отдела, иначе сделку игнорируем (изоляция
-        # проектов — см. ТЗ «Многопоточность по отделам»).
-        # Если отделов ещё не создано — старое поведение: один общий
-        # BITRIX_DEAL_CATEGORY_ID / BITRIX_STAGE_TRIGGER из .env.
-        department_id: Optional[int] = None
-        dept = await find_department_for_deal(category_id, stage)
-        any_departments = await _departments_exist()
-        if any_departments:
-            if not dept:
+            # Если в базе настроены отделы (см. /departments) — работаем СТРОГО
+            # по ним: воронка+стадия сделки должны совпасть с воронкой+триггерной
+            # стадией какого-то отдела, иначе сделку игнорируем (изоляция
+            # проектов — см. ТЗ «Многопоточность по отделам»).
+            # Если отделов ещё не создано — старое поведение: один общий
+            # BITRIX_DEAL_CATEGORY_ID / BITRIX_STAGE_TRIGGER из .env.
+            department_id: Optional[int] = None
+            dept = await find_department_for_deal(category_id, stage)
+            any_departments = await _departments_exist()
+            if any_departments:
+                if not dept:
+                    logger.info(
+                        "[webhook-deal] сделка #%d: category=%s stage=%s не "
+                        "совпадает ни с одним отделом — игнор",
+                        d_id, category_id, stage,
+                    )
+                    return
+                department_id = dept.id
                 logger.info(
-                    "[webhook-deal] сделка #%d: category=%s stage=%s не "
-                    "совпадает ни с одним отделом — игнор",
-                    d_id, category_id, stage,
+                    "[webhook-deal] сделка #%d → отдел «%s» (id=%d)",
+                    d_id, dept.name, dept.id,
+                )
+            else:
+                # Фильтр: только целевая воронка (из настроек, по умолчанию Я360=12)
+                if category_id != str(settings.BITRIX_DEAL_CATEGORY_ID):
+                    logger.info(
+                        "[webhook-deal] сделка #%d: category=%s, не наша воронка (%s) — игнор",
+                        d_id, category_id, settings.BITRIX_DEAL_CATEGORY_ID,
+                    )
+                    return
+                # Фильтр: только триггерная стадия (из настроек)
+                if stage != settings.BITRIX_STAGE_TRIGGER:
+                    logger.info(
+                        "[webhook-deal] сделка #%d: стадия=%s, не триггер (%s) — игнор",
+                        d_id, stage, settings.BITRIX_STAGE_TRIGGER,
+                    )
+                    return
+
+            # Телефон: всеядный поиск — сделка → контакт(ы) → компания (поля, UF, названия)
+            phone = await find_deal_phone(deal)
+            if not phone:
+                logger.warning("[webhook-deal] сделка #%d: нет телефона", d_id)
+                await add_deal_comment(
+                    d_id,
+                    "Автодозвон: не удалось запустить — в сделке нет номера телефона.",
                 )
                 return
-            department_id = dept.id
+
+            meta = extract_deal_meta(deal)
             logger.info(
-                "[webhook-deal] сделка #%d → отдел «%s» (id=%d)",
-                d_id, dept.name, dept.id,
+                "[webhook-deal] сделка #%d | телефон=%s | название=%s",
+                d_id, phone, meta.get("name"),
             )
-        else:
-            # Фильтр: только целевая воронка (из настроек, по умолчанию Я360=12)
-            if category_id != str(settings.BITRIX_DEAL_CATEGORY_ID):
-                logger.info(
-                    "[webhook-deal] сделка #%d: category=%s, не наша воронка (%s) — игнор",
-                    d_id, category_id, settings.BITRIX_DEAL_CATEGORY_ID,
-                )
-                return
-            # Фильтр: только триггерная стадия (из настроек)
-            if stage != settings.BITRIX_STAGE_TRIGGER:
-                logger.info(
-                    "[webhook-deal] сделка #%d: стадия=%s, не триггер (%s) — игнор",
-                    d_id, stage, settings.BITRIX_STAGE_TRIGGER,
-                )
-                return
 
-        # Телефон: всеядный поиск — сделка → контакт(ы) → компания (поля, UF, названия)
-        phone = await find_deal_phone(deal)
-        if not phone:
-            logger.warning("[webhook-deal] сделка #%d: нет телефона", d_id)
+            # Если у сделки нет осмысленного названия — назвать её номером
+            # (оператору удобнее видеть номер, а не «Сделка #...»).
+            await set_deal_title_to_phone(d_id, phone, meta.get("name") or "")
+
+            # Комментарий «взяли в работу»
             await add_deal_comment(
                 d_id,
-                "Автодозвон: не удалось запустить — в сделке нет номера телефона.",
+                f"Автодозвон: сделка взята в работу, запускаем звонок.",
             )
-            return
 
-        meta = extract_deal_meta(deal)
-        logger.info(
-            "[webhook-deal] сделка #%d | телефон=%s | название=%s",
-            d_id, phone, meta.get("name"),
-        )
-
-        # Если у сделки нет осмысленного названия — назвать её номером
-        # (оператору удобнее видеть номер, а не «Сделка #...»).
-        await set_deal_title_to_phone(d_id, phone, meta.get("name") or "")
-
-        # Комментарий «взяли в работу»
-        await add_deal_comment(
-            d_id,
-            f"Автодозвон: сделка взята в работу, запускаем звонок.",
-        )
-
-        # Запускаем ту же логику что и для лидов
-        await process_new_lead(
-            d_id, phone,
-            lead_name=meta.get("name"),
-            lead_source=meta.get("source"),
-            received_at=ts,
-            department_id=department_id,
-        )
+            # Запускаем ту же логику что и для лидов
+            await process_new_lead(
+                d_id, phone,
+                lead_name=meta.get("name"),
+                lead_source=meta.get("source"),
+                received_at=ts,
+                department_id=department_id,
+            )
+        except Exception as e:
+            logger.error(
+                "[webhook-deal] сделка #%d: необработанная ошибка — лид НЕ "
+                "обработан: %s", d_id, e, exc_info=True,
+            )
+            try:
+                await add_deal_comment(
+                    d_id,
+                    "Автодозвон: техническая ошибка, звонок НЕ запущен. "
+                    "Обработайте эту сделку вручную и сообщите администратору.",
+                )
+            except Exception:
+                pass
+            await send_alert(
+                f"🔴 Сделка #{d_id}: техническая ошибка автодозвона — лид НЕ "
+                f"обработан, нужна ручная обработка! ({e})"
+            )
 
     background_tasks.add_task(_process_deal, deal_id, received_at)
     return {"ok": True, "deal_id": deal_id, "queued": True}
