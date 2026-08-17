@@ -426,8 +426,15 @@ async def get_deal_card(deal_id: int) -> Dict[str, Any]:
 
 async def add_deal_task(deal_id: int, title: str,
                         responsible_id: Optional[int] = None,
-                        description: str = "") -> Optional[dict]:
-    """Поставить задачу, привязанную к сделке."""
+                        description: str = "",
+                        deadline: Optional[str] = None) -> Optional[dict]:
+    """Поставить задачу, привязанную к сделке.
+
+    deadline — ISO datetime со смещением (например "2026-08-20T16:00:00+05:00").
+    Задаёт DEADLINE у задачи в Bitrix — именно это поле включает штатное
+    поведение Bitrix «просроченная задача подсвечивается красным» и
+    напоминание, без какой-либо доп. логики с нашей стороны.
+    """
     url = settings.bitrix_base_url + "tasks.task.add.json"
     fields: Dict[str, Any] = {
         "TITLE": title,
@@ -436,6 +443,8 @@ async def add_deal_task(deal_id: int, title: str,
     }
     if responsible_id:
         fields["RESPONSIBLE_ID"] = responsible_id
+    if deadline:
+        fields["DEADLINE"] = deadline
     try:
         return await _post(url, {"fields": fields})
     except Exception as e:

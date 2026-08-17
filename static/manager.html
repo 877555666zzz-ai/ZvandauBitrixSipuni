@@ -298,8 +298,9 @@
           <textarea id="comment-text" placeholder="Комментарий к сделке…"></textarea>
           <div class="row">
             <button onclick="addComment()">Сохранить коммент</button>
-            <button class="ghost" onclick="addTask()">Поставить задачу</button>
+            <button class="ghost" onclick="toggleTaskBox()">Поставить задачу</button>
           </div>
+          <div id="task-box" style="display:none;margin-top:8px"></div>
           <button class="open-bx" onclick="openBitrix()">Открыть в Bitrix</button>
           <button class="open-bx" id="transfer-btn" onclick="toggleTransfer()">↪ Перекинуть на коллегу</button>
           <div id="transfer-box" style="display:none;margin-top:8px"></div>
@@ -566,7 +567,7 @@ async function markReady(){
   }catch(e){toast('Ошибка соединения',true);}
   finally{ btn.disabled=false; }
 }
-function hideCall(){document.getElementById('call-card').style.display='none';document.getElementById('idle').style.display='block';LAST_LEAD=null;CURRENT_LEAD=null;const _ct=document.getElementById('comment-text');if(_ct)_ct.value='';const _ss=document.getElementById('stage-select');if(_ss)_ss.selectedIndex=0;const _tb=document.getElementById('transfer-box');if(_tb){_tb.style.display='none';_tb.innerHTML='';}TRANSFER_OPEN=false;}
+function hideCall(){document.getElementById('call-card').style.display='none';document.getElementById('idle').style.display='block';LAST_LEAD=null;CURRENT_LEAD=null;const _ct=document.getElementById('comment-text');if(_ct)_ct.value='';const _ss=document.getElementById('stage-select');if(_ss)_ss.selectedIndex=0;const _tb=document.getElementById('transfer-box');if(_tb){_tb.style.display='none';_tb.innerHTML='';}TRANSFER_OPEN=false;const _tkb=document.getElementById('task-box');if(_tkb){_tkb.style.display='none';_tkb.innerHTML='';}TASK_OPEN=false;}
 
 async function loadLeads(){
   const box=document.getElementById('leads-list');
@@ -617,10 +618,34 @@ async function addComment(){
   if(!text){toast('Введите комментарий',true);return;}
   try{const r=await fetch('/manager/api/action/comment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_id:CURRENT_LEAD,text})});if(r.ok){document.getElementById('comment-text').value='';toast('Комментарий сохранён');}else toast('Ошибка',true);}catch(e){toast('Ошибка соединения',true);}
 }
-async function addTask(){
+let TASK_OPEN=false;
+function toggleTaskBox(){
+  const box=document.getElementById('task-box');
+  TASK_OPEN=!TASK_OPEN;
+  if(!TASK_OPEN){box.style.display='none';box.innerHTML='';return;}
+  box.style.display='block';
+  const d=new Date(Date.now()+60*60*1000);
+  d.setMinutes(0,0,0);
+  const pad=n=>String(n).padStart(2,'0');
+  const def=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  box.innerHTML=`
+    <input type="datetime-local" id="task-deadline" value="${def}">
+    <div class="row" style="margin-top:8px">
+      <button onclick="submitTask()">Сохранить напоминание</button>
+      <button class="ghost" onclick="toggleTaskBox()">Отмена</button>
+    </div>`;
+}
+async function submitTask(){
   if(!CURRENT_LEAD)return;
   const text=document.getElementById('comment-text').value.trim()||'Связаться с клиентом';
-  try{const r=await fetch('/manager/api/action/task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_id:CURRENT_LEAD,title:text})});toast(r.ok?'Задача поставлена':'Ошибка',!r.ok);}catch(e){toast('Ошибка соединения',true);}
+  const deadlineEl=document.getElementById('task-deadline');
+  const deadline=deadlineEl?deadlineEl.value:'';
+  if(!deadline){toast('Укажите дату и время',true);return;}
+  try{
+    const r=await fetch('/manager/api/action/task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lead_id:CURRENT_LEAD,title:text,deadline})});
+    toast(r.ok?'Задача поставлена — сработает как напоминание':'Ошибка',!r.ok);
+    if(r.ok){toggleTaskBox();}
+  }catch(e){toast('Ошибка соединения',true);}
 }
 function openBitrix(){
   if(!CURRENT_LEAD)return;

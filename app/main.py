@@ -32,6 +32,7 @@ from .bitrix_client import (
     add_lead_comment,
     add_deal_task,
     assign_deal_responsible,
+    _find_bitrix_user_by_sip,
     extract_deal_meta,
     extract_lead_meta,
     extract_phone,
@@ -1660,6 +1661,7 @@ class PortalComment(BaseModel):
 class PortalTask(BaseModel):
     lead_id: int
     title: str
+    deadline: Optional[str] = None
 
 
 @app.post("/manager/api/action/stage", include_in_schema=False)
@@ -1693,7 +1695,19 @@ async def portal_action_task(data: PortalTask,
     mgr = await portal.get_session_manager(mgr_session)
     if not mgr:
         raise HTTPException(status_code=401, detail="no session")
-    res = await add_deal_task(data.lead_id, data.title)
+    responsible_id = await _find_bitrix_user_by_sip(mgr.sipnumber) if mgr.sipnumber else None
+    deadline = None
+    if data.deadline:
+        # Фронтенд шлёт "YYYY-MM-DDTHH:MM" (локальное время оператора,
+        # Алматы UTC+5) — дополняем секундами и смещением для Bitrix.
+        raw = data.deadline.strip()
+        if len(raw) == 16:
+            raw += ":00"
+        deadline = raw + "+05:00"
+    res = await add_deal_task(
+        data.lead_id, data.title,
+        responsible_id=responsible_id, deadline=deadline,
+    )
     return {"ok": res is not None}
 
 
