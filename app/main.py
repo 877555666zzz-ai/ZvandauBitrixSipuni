@@ -6,7 +6,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import (
     BackgroundTasks,
@@ -1345,23 +1345,23 @@ async def _check_kcell_secret(request: Request) -> None:
     if not settings.KCELL_CRM_SECRET:
         return
     incoming = (
-        request.query_params.get("secret")
+        request.headers.get("X-API-KEY")
         or request.headers.get("X-Kcell-Secret")
+        or request.query_params.get("secret")
         or ""
     )
-    body_json: Any = None
     if not incoming:
         try:
-            body_json = await request.json()
-            if isinstance(body_json, dict):
-                incoming = str(body_json.get("crm_token") or body_json.get("token") or "")
+            json_body = await request.json()
+            if isinstance(json_body, dict):
+                incoming = str(json_body.get("crm_token") or json_body.get("token") or "")
         except Exception:
-            pass
+            try:
+                form = await request.form()
+                incoming = str(form.get("crm_token") or form.get("token") or "")
+            except Exception:
+                pass
     if not secrets.compare_digest(incoming, settings.KCELL_CRM_SECRET):
-        logger.warning(
-            "[kcell-event] REJECTED (диагностика) query=%s headers=%s body=%s",
-            dict(request.query_params), dict(request.headers), body_json,
-        )
         raise HTTPException(status_code=403, detail="invalid_kcell_secret")
 
 
