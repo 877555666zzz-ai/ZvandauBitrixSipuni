@@ -2,28 +2,25 @@
 """
 Kcell Virtual PBX — CRM REST API client.
 
-Официальный CRM REST API Kcell (Виртуальная АТС), команды:
-  makeCall  — инициировать исходящий звонок (менеджер → клиент)
-  history   — получить детали звонка по call_id (длительность, статус)
-  event     — Kcell шлёт нам на CRM webhook уведомления о звонке (см.
-              parse_kcell_event ниже; сама выдача события идёт со стороны
-              main.py, здесь только разбор тела запроса)
+Официальный CRM REST API Kcell (Виртуальная АТС) — см. rest_api.pdf:
+  POST /crmapi/v1/makecall  — инициировать исходящий звонок
+       (менеджер → клиент), заголовок X-API-KEY, payload
+       {"phone": "<клиент>", "user": "<логин/добавочный менеджера>"}.
+       Ответ: {"callid": "...", "clid": "..."} (без поля status).
+  event  — Kcell шлёт нам на CRM webhook уведомления о звонке (см.
+           parse_kcell_event ниже; сама выдача события идёт со стороны
+           main.py, здесь только разбор тела запроса).
 
-Общий конверт запроса/ответа — команда (cmd) + статус (status) + call_id:
-  {
-    "cmd": "makeCall" | "event" | "history",
-    "callid": "<call id>",
-    "status": "ACCEPTED" | "CANCELLED",
-    "duration": <секунды, опционально>,
-    ...
-  }
+Авторизация всех исходящих запросов К Kcell — HTTP-заголовок
+"X-API-KEY: <KCELL_API_KEY>" (см. _headers). Это НЕ Authorization: Bearer
+и НЕ поле token в body.
 
 Все callback'и работают через callid — это первичный ключ для сопоставления
 звонка с CallSession, номер телефона используется только как fallback.
 
-makeCall — асинхронный: ACCEPTED означает «Kcell принял заявку и начал
-дозвон», а не «разговор состоялся». Реальный итог звонка приходит позже
-через event-webhook на наш KCELL_CRM_URL.
+makeCall — асинхронный: наличие callid в ответе означает «Kcell принял
+заявку и начал дозвон», а не «разговор состоялся». Реальный итог звонка
+приходит позже через event-webhook на наш KCELL_CRM_URL.
 """
 import logging
 from typing import Any, Dict, List, Optional
@@ -37,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 def _headers() -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {settings.KCELL_API_KEY}",
+        "X-API-KEY": settings.KCELL_API_KEY,
         "Content-Type": "application/json",
     }
 
@@ -69,13 +66,10 @@ async def make_outbound_call(manager_sipnumber: str, client_number: str) -> dict
             "raw": "", "data": None, "error": "kcell_disabled",
         }
 
-    url = f"{_base_url()}/makeCall"
+    url = f"{_base_url()}/makecall"
     payload: Dict[str, Any] = {
-        "cmd": "makeCall",
-        "token": settings.KCELL_API_KEY,
-        "from": manager_sipnumber,
-        "to": client_number,
-        "crmName": settings.KCELL_CRM_NAME,
+        "phone": client_number,
+        "user": manager_sipnumber,
     }
 
     try:
@@ -113,24 +107,22 @@ async def make_outbound_call(manager_sipnumber: str, client_number: str) -> dict
     except Exception:
         parsed = None
 
-    status = None
     call_id = None
     if isinstance(parsed, dict):
-        status = str(parsed.get("status") or "").strip().upper()
         call_id = parsed.get("callid") or parsed.get("call_id")
 
-    success = status == "ACCEPTED"
+    success = bool(call_id)
 
     logger.info(
-        "[kcell] makeCall from=%s to=%s status=%s callid=%s",
-        manager_sipnumber, client_number, status, call_id,
+        "[kcell] makeCall from=%s to=%s callid=%s",
+        manager_sipnumber, client_number, call_id,
     )
     return {
         "callback_created": success,
         "call_id": str(call_id) if call_id else None,
         "raw": raw_text,
         "data": parsed,
-        "error": None if success else (status or "cancelled"),
+        "error": None if success else "no_callid_in_response",
     }
 
 

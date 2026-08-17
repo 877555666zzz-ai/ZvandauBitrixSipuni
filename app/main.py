@@ -1349,6 +1349,13 @@ async def _check_kcell_secret(request: Request) -> None:
         or request.headers.get("X-Kcell-Secret")
         or ""
     )
+    if not incoming:
+        try:
+            json_body = await request.json()
+            if isinstance(json_body, dict):
+                incoming = str(json_body.get("crm_token") or json_body.get("token") or "")
+        except Exception:
+            pass
     if not secrets.compare_digest(incoming, settings.KCELL_CRM_SECRET):
         raise HTTPException(status_code=403, detail="invalid_kcell_secret")
 
