@@ -72,6 +72,7 @@ async def make_outbound_call(manager_sipnumber: str, client_number: str) -> dict
     url = f"{_base_url()}/makeCall"
     payload: Dict[str, Any] = {
         "cmd": "makeCall",
+        "token": settings.KCELL_API_KEY,
         "from": manager_sipnumber,
         "to": client_number,
         "crmName": settings.KCELL_CRM_NAME,
@@ -142,7 +143,7 @@ async def get_call_history(call_id: str) -> Optional[Dict[str, Any]]:
     if not call_id:
         return None
     url = f"{_base_url()}/history"
-    payload = {"cmd": "history", "callid": call_id}
+    payload = {"cmd": "history", "token": settings.KCELL_API_KEY, "callid": call_id}
     try:
         async with httpx.AsyncClient(timeout=settings.KCELL_TIMEOUT_SECONDS) as client:
             r = await client.post(url, headers=_headers(), json=payload)
