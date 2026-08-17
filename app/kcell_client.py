@@ -83,10 +83,15 @@ async def make_outbound_call(manager_sipnumber: str, client_number: str) -> dict
             r.raise_for_status()
             raw_text = r.text or ""
     except httpx.HTTPStatusError as e:
-        logger.error("[kcell] makeCall HTTP %s: %s", e.response.status_code, e)
+        body = e.response.text or ""
+        logger.error(
+            "[kcell] makeCall HTTP %s: from=%s to=%s body=%s",
+            e.response.status_code, manager_sipnumber, client_number, body[:500],
+        )
         return {
             "callback_created": False, "call_id": None,
-            "raw": "", "data": None, "error": f"HTTP {e.response.status_code}",
+            "raw": body, "data": None,
+            "error": f"HTTP {e.response.status_code}: {body[:200]}" if body else f"HTTP {e.response.status_code}",
         }
     except httpx.TimeoutException:
         logger.error("[kcell] makeCall timeout: from=%s to=%s", manager_sipnumber, client_number)
