@@ -9,7 +9,7 @@
 <style>
   :root {
     --bg1:#0c1322; --bg2:#111a2e; --bg3:#0a1f2e;
-    --surface:rgba(255,255,255,0.05); --surface-solid:#161d2e;
+    --surface:rgba(255,255,255,0.05); --surface-solid:#161d2e; --glass-bg:rgba(22,29,46,0.86);
     --border:rgba(255,255,255,0.10); --border-strong:rgba(255,255,255,0.18);
     --text:#eef1f7; --text-dim:#9aa3b6; --text-faint:#6b7488;
     --accent:#4f8ff7; --accent-h:#3f7de0;
@@ -21,7 +21,7 @@
   }
   [data-theme="light"] {
     --bg1:#eef2fb; --bg2:#e3ebfa; --bg3:#f3f0fb;
-    --surface:rgba(255,255,255,0.72); --surface-solid:#ffffff;
+    --surface:rgba(255,255,255,0.72); --surface-solid:#ffffff; --glass-bg:rgba(255,255,255,0.90);
     --border:rgba(20,30,60,0.10); --border-strong:rgba(20,30,60,0.16);
     --text:#16203a; --text-dim:#5a647c; --text-faint:#8b93a7;
     --accent:#2f6fe0; --accent-h:#245ec4;
@@ -57,10 +57,12 @@
   }
   @media (prefers-reduced-motion:reduce){ body::before{animation:none;} }
   .wrap { width:100%; max-width:760px; margin:0 auto; padding:22px 18px 60px; }
+  /* Без backdrop-filter: на слабых ноутбуках размытие часто без
+     аппаратного ускорения — самый тяжёлый эффект на странице. Вместо
+     этого — просто более плотный фон, без пересчёта каждый кадр. */
   .glass {
-    background:var(--surface); border:1px solid var(--border); border-radius:20px;
-    box-shadow:var(--shadow); backdrop-filter:blur(12px) saturate(120%);
-    -webkit-backdrop-filter:blur(12px) saturate(120%);
+    background:var(--glass-bg); border:1px solid var(--border); border-radius:20px;
+    box-shadow:var(--shadow);
   }
   /* Ready strip (всегда сверху, не исчезает) */
   .ready-strip {
